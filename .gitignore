@@ -1,0 +1,5 @@
+.venv
+saved_resumes
+data
+__pycache__/
+.env
