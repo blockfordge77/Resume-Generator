@@ -124,9 +124,82 @@ def init_state() -> None:
         'pending_nav_page': '',
         'job_list_notice': '',
         'pending_dashboard_approved_job_id': '',
+        'auth_token_value': '',
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
+
+
+AUTH_QUERY_KEY = 'auth_token'
+
+
+def _query_param_value(name: str) -> str:
+    try:
+        value = st.query_params.get(name, '')
+    except Exception:
+        try:
+            value = st.experimental_get_query_params().get(name, [''])
+        except Exception:
+            value = ''
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else ''
+    return str(value or '').strip()
+
+
+def _set_query_param_value(name: str, value: str) -> None:
+    clean = str(value or '').strip()
+    try:
+        if clean:
+            st.query_params[name] = clean
+        elif name in st.query_params:
+            del st.query_params[name]
+        return
+    except Exception:
+        pass
+    try:
+        params = dict(st.experimental_get_query_params())
+        if clean:
+            params[name] = clean
+        else:
+            params.pop(name, None)
+        st.experimental_set_query_params(**params)
+    except Exception:
+        pass
+
+
+def _get_auth_query_token() -> str:
+    return _query_param_value(AUTH_QUERY_KEY)
+
+
+def _persist_login_token(raw_token: str) -> None:
+    st.session_state['auth_token_value'] = str(raw_token or '').strip()
+    _set_query_param_value(AUTH_QUERY_KEY, st.session_state['auth_token_value'])
+
+
+def _clear_login_token() -> None:
+    raw_token = str(st.session_state.get('auth_token_value', '') or _get_auth_query_token()).strip()
+    if raw_token:
+        try:
+            storage.revoke_auth_token(raw_token)
+        except Exception:
+            pass
+    st.session_state['auth_token_value'] = ''
+    _set_query_param_value(AUTH_QUERY_KEY, '')
+
+
+def _restore_auth_from_token() -> None:
+    if st.session_state.get('current_user_id'):
+        return
+    raw_token = _get_auth_query_token()
+    if not raw_token:
+        return
+    user = storage.get_user_by_auth_token(raw_token)
+    if user and user.get('status') == 'approved':
+        st.session_state['current_user_id'] = user.get('id', '')
+        st.session_state['auth_token_value'] = raw_token
+        return
+    st.session_state['auth_token_value'] = ''
+    _set_query_param_value(AUTH_QUERY_KEY, '')
 
 
 # ---------- Job scraping ----------
@@ -450,6 +523,8 @@ def login_screen() -> None:
                     st.error('Incorrect password.')
                     return
                 st.session_state['current_user_id'] = user.get('id', '')
+                remember_token = storage.issue_auth_token(user.get('id', ''), ttl_days=30)
+                _persist_login_token(remember_token)
                 st.session_state['auth_notice'] = f"Welcome back, {user.get('full_name') or user.get('username')}"
                 st.rerun()
 
@@ -1945,51 +2020,65 @@ def job_list_page(user: dict) -> None:
                     st.rerun()
             if not pending_jobs:
                 st.info('No pending jobs to review.')
+            else:
+                st.caption('Pending job edits are grouped in submit forms so typing does not rerender the whole page.')
             for job in pending_jobs:
                 with st.expander(f"Pending • {_job_summary_label(job)}"):
                     st.caption(f"Source: {job.get('source', 'manual')} • Scrape status: {job.get('scrape_status', 'n/a')}")
                     if job.get('scrape_error'):
                         st.warning(job.get('scrape_error'))
-                    company_key = f"pending_job_company_{job.get('id')}"
-                    title_key = f"pending_job_title_{job.get('id')}"
-                    link_key = f"pending_job_link_{job.get('id')}"
-                    note_key = f"pending_job_note_{job.get('id')}"
-                    desc_key = f"pending_job_desc_{job.get('id')}"
-                    region_key = f"pending_job_region_{job.get('id')}"
-                    if company_key not in st.session_state:
-                        st.session_state[company_key] = job.get('company', '')
-                        st.session_state[title_key] = job.get('job_title', '')
-                        st.session_state[link_key] = job.get('link', '')
-                        st.session_state[note_key] = job.get('note', '')
-                        st.session_state[desc_key] = job.get('description', '')
-                        st.session_state[region_key] = _region_label(job.get('region', 'US'))
-                    st.text_input('Company', key=company_key)
-                    st.text_input('Job title', key=title_key)
-                    st.text_input('Link', key=link_key)
-                    st.selectbox('Job market', REGION_OPTIONS, key=region_key)
-                    st.text_area('Description', key=desc_key, height=220)
-                    st.text_area('Note', key=note_key, height=90)
-                    c1, c2, c3, c4 = st.columns(4)
-                    with c1:
-                        if st.button('Save draft', key=f"save_pending_{job.get('id')}", use_container_width=True):
-                            storage.update_job(job.get('id', ''), {'company': st.session_state.get(company_key, ''), 'job_title': st.session_state.get(title_key, ''), 'link': st.session_state.get(link_key, ''), 'region': _normalize_region(st.session_state.get(region_key, 'US')), 'description': st.session_state.get(desc_key, ''), 'note': st.session_state.get(note_key, '')})
-                            st.success('Pending job updated.')
-                            st.rerun()
-                    with c2:
-                        if st.button('Approve', key=f"approve_pending_{job.get('id')}", type='primary', use_container_width=True):
-                            storage.update_job(job.get('id', ''), {'company': st.session_state.get(company_key, ''), 'job_title': st.session_state.get(title_key, ''), 'link': st.session_state.get(link_key, ''), 'region': _normalize_region(st.session_state.get(region_key, 'US')), 'description': st.session_state.get(desc_key, ''), 'note': st.session_state.get(note_key, ''), 'status': 'approved', 'approved_at': datetime.utcnow().isoformat() + 'Z', 'approved_by_user_id': user.get('id', ''), 'approved_by_username': user.get('username', ''), 'scrape_status': 'done' if st.session_state.get(desc_key, '').strip() else job.get('scrape_status', 'queued')})
-                            st.success('Job approved and visible to all users.')
-                            st.rerun()
-                    with c3:
-                        if st.button('Requeue scrape', key=f"requeue_pending_{job.get('id')}", use_container_width=True):
-                            storage.update_job(job.get('id', ''), {'company': st.session_state.get(company_key, ''), 'job_title': st.session_state.get(title_key, ''), 'link': st.session_state.get(link_key, ''), 'region': _normalize_region(st.session_state.get(region_key, 'US')), 'note': st.session_state.get(note_key, ''), 'description': st.session_state.get(desc_key, ''), 'scrape_status': 'queued', 'scrape_error': ''})
-                            st.success('Job queued for background scraping.')
-                            st.rerun()
-                    with c4:
-                        if st.button('Delete', key=f"delete_pending_{job.get('id')}", use_container_width=True):
-                            storage.delete_job(job.get('id', ''))
-                            st.success('Pending job deleted.')
-                            st.rerun()
+                    with st.form(key=f"pending_job_form_{job.get('id')}", clear_on_submit=False):
+                        company_value = st.text_input('Company', value=job.get('company', ''), key=f"pending_job_company_form_{job.get('id')}")
+                        title_value = st.text_input('Job title', value=job.get('job_title', ''), key=f"pending_job_title_form_{job.get('id')}")
+                        link_value = st.text_input('Link', value=job.get('link', ''), key=f"pending_job_link_form_{job.get('id')}")
+                        region_label = _region_label(job.get('region', 'US'))
+                        try:
+                            region_index = REGION_OPTIONS.index(region_label)
+                        except ValueError:
+                            region_index = REGION_OPTIONS.index('US') if 'US' in REGION_OPTIONS else 0
+                        region_value = st.selectbox('Job market', REGION_OPTIONS, index=region_index, key=f"pending_job_region_form_{job.get('id')}")
+                        desc_value = st.text_area('Description', value=job.get('description', ''), height=220, key=f"pending_job_desc_form_{job.get('id')}")
+                        note_value = st.text_area('Note', value=job.get('note', ''), height=90, key=f"pending_job_note_form_{job.get('id')}")
+                        c1, c2, c3, c4 = st.columns(4)
+                        save_clicked = c1.form_submit_button('Save draft', use_container_width=True)
+                        approve_clicked = c2.form_submit_button('Approve', type='primary', use_container_width=True)
+                        requeue_clicked = c3.form_submit_button('Requeue scrape', use_container_width=True)
+                        delete_clicked = c4.form_submit_button('Delete', use_container_width=True)
+
+                    base_patch = {
+                        'company': company_value,
+                        'job_title': title_value,
+                        'link': link_value,
+                        'region': _normalize_region(region_value),
+                        'description': desc_value,
+                        'note': note_value,
+                    }
+                    if save_clicked:
+                        storage.update_job(job.get('id', ''), base_patch)
+                        st.session_state['job_list_notice'] = 'Pending job updated.'
+                        st.rerun()
+                    if approve_clicked:
+                        patch = dict(base_patch)
+                        patch.update({
+                            'status': 'approved',
+                            'approved_at': datetime.utcnow().isoformat() + 'Z',
+                            'approved_by_user_id': user.get('id', ''),
+                            'approved_by_username': user.get('username', ''),
+                            'scrape_status': 'done' if str(desc_value).strip() else job.get('scrape_status', 'queued'),
+                        })
+                        storage.update_job(job.get('id', ''), patch)
+                        st.session_state['job_list_notice'] = 'Job approved and visible to all users.'
+                        st.rerun()
+                    if requeue_clicked:
+                        patch = dict(base_patch)
+                        patch.update({'scrape_status': 'queued', 'scrape_error': ''})
+                        storage.update_job(job.get('id', ''), patch)
+                        st.session_state['job_list_notice'] = 'Job queued for background scraping.'
+                        st.rerun()
+                    if delete_clicked:
+                        storage.delete_job(job.get('id', ''))
+                        st.session_state['job_list_notice'] = 'Pending job deleted.'
+                        st.rerun()
 
 
 # ---------- Generated resumes ----------
@@ -2529,6 +2618,7 @@ def render_top_nav(user: dict) -> str:
             )
         with logout_col:
             if st.button('Logout', key='top_logout_btn', use_container_width=True):
+                _clear_login_token()
                 st.session_state['current_user_id'] = ''
                 st.session_state['pending_nav_page'] = ''
                 st.session_state['auth_notice'] = 'You are signed out.'
@@ -2540,6 +2630,7 @@ def render_top_nav(user: dict) -> str:
 # ---------- Boot ----------
 
 init_state()
+_restore_auth_from_token()
 start_job_scrape_worker(str(APP_DIR / 'data'))
 current_user = require_auth()
 page = render_top_nav(current_user)

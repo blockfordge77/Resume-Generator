@@ -5,7 +5,7 @@ import json
 import secrets
 import threading
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from json import JSONDecodeError, JSONDecoder
 from pathlib import Path
 from typing import Any
@@ -31,6 +31,10 @@ def verify_password(password: str, salt: str, expected_hash: str) -> bool:
         return False
     candidate = hashlib.pbkdf2_hmac('sha256', str(password).encode('utf-8'), str(salt).encode('utf-8'), 200_000).hex()
     return secrets.compare_digest(candidate, str(expected_hash))
+
+
+def _hash_auth_token(token: str) -> str:
+    return hashlib.sha256(str(token or '').encode('utf-8')).hexdigest()
 
 
 class Storage:
@@ -281,6 +285,101 @@ class Storage:
                     self._write_json(self.users_path, items)
                     return
 
+    def issue_auth_token(self, user_id: str, ttl_days: int = 30) -> str:
+        raw_token = secrets.token_urlsafe(32)
+        now = datetime.utcnow()
+        expires_at = (now + timedelta(days=max(1, int(ttl_days or 30)))).isoformat() + 'Z'
+        token_record = {
+            'token_id': self.make_id('tok'),
+            'token_hash': _hash_auth_token(raw_token),
+            'created_at': now.isoformat() + 'Z',
+            'expires_at': expires_at,
+            'last_seen_at': now.isoformat() + 'Z',
+            'revoked_at': '',
+        }
+        with self._lock:
+            items = self.get_users()
+            for index, item in enumerate(items):
+                if item.get('id') == user_id:
+                    tokens = [t for t in (item.get('auth_tokens', []) or []) if not str((t or {}).get('revoked_at', '')).strip()]
+                    tokens = self._normalize_auth_tokens(tokens)
+                    tokens.insert(0, token_record)
+                    items[index] = self._normalize_users([item | {'auth_tokens': tokens[:10]}])[0]
+                    self._write_json(self.users_path, items)
+                    return raw_token
+        return raw_token
+
+    def get_user_by_auth_token(self, raw_token: str) -> dict | None:
+        token_hash = _hash_auth_token(raw_token)
+        now = datetime.utcnow()
+        with self._lock:
+            items = self.get_users()
+            changed = False
+            matched_user = None
+            for index, item in enumerate(items):
+                tokens = self._normalize_auth_tokens(item.get('auth_tokens', []) or [])
+                refreshed_tokens = []
+                user_changed = False
+                for token in tokens:
+                    expires_at = self._parse_iso_datetime(token.get('expires_at', ''))
+                    revoked_at = self._parse_iso_datetime(token.get('revoked_at', ''))
+                    if revoked_at or (expires_at and expires_at < now):
+                        user_changed = True
+                        continue
+                    if token.get('token_hash') == token_hash:
+                        token = token | {'last_seen_at': now.isoformat() + 'Z'}
+                        matched_user = item
+                        user_changed = True
+                    refreshed_tokens.append(token)
+                if user_changed:
+                    items[index] = self._normalize_users([item | {'auth_tokens': refreshed_tokens}])[0]
+                    changed = True
+            if changed:
+                self._write_json(self.users_path, items)
+            if matched_user:
+                return self.get_user_by_id(matched_user.get('id', ''))
+        return None
+
+    def revoke_auth_token(self, raw_token: str) -> None:
+        token_hash = _hash_auth_token(raw_token)
+        with self._lock:
+            items = self.get_users()
+            changed = False
+            for index, item in enumerate(items):
+                tokens = []
+                user_changed = False
+                for token in self._normalize_auth_tokens(item.get('auth_tokens', []) or []):
+                    if token.get('token_hash') == token_hash and not str(token.get('revoked_at', '')).strip():
+                        token = token | {'revoked_at': datetime.utcnow().isoformat() + 'Z'}
+                        user_changed = True
+                    tokens.append(token)
+                if user_changed:
+                    items[index] = self._normalize_users([item | {'auth_tokens': tokens}])[0]
+                    changed = True
+            if changed:
+                self._write_json(self.users_path, items)
+
+    def revoke_all_auth_tokens_for_user(self, user_id: str) -> None:
+        with self._lock:
+            items = self.get_users()
+            changed = False
+            for index, item in enumerate(items):
+                if item.get('id') != user_id:
+                    continue
+                tokens = []
+                any_changed = False
+                now_value = datetime.utcnow().isoformat() + 'Z'
+                for token in self._normalize_auth_tokens(item.get('auth_tokens', []) or []):
+                    if not str(token.get('revoked_at', '')).strip():
+                        token = token | {'revoked_at': now_value}
+                        any_changed = True
+                    tokens.append(token)
+                if any_changed:
+                    items[index] = self._normalize_users([item | {'auth_tokens': tokens}])[0]
+                    changed = True
+            if changed:
+                self._write_json(self.users_path, items)
+
     # Jobs
     def get_jobs(self, include_pending: bool = True) -> list[dict]:
         with self._lock:
@@ -382,6 +481,41 @@ class Storage:
 
     def complete_job_scrape(self, job_id: str, patch: dict) -> None:
         self.update_job(job_id, patch)
+
+    def _parse_iso_datetime(self, value: str) -> datetime | None:
+        raw = str(value or '').strip()
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(raw.replace('Z', '+00:00')).replace(tzinfo=None)
+        except Exception:
+            return None
+
+    def _normalize_auth_tokens(self, items: Any) -> list[dict]:
+        normalized: list[dict] = []
+        now = datetime.utcnow()
+        for item in items or []:
+            token_hash = str((item or {}).get('token_hash', '')).strip()
+            if not token_hash:
+                continue
+            expires_at = str((item or {}).get('expires_at', '')).strip()
+            revoked_at = str((item or {}).get('revoked_at', '')).strip()
+            expires_dt = self._parse_iso_datetime(expires_at)
+            revoked_dt = self._parse_iso_datetime(revoked_at)
+            if revoked_dt:
+                continue
+            if expires_dt and expires_dt < now:
+                continue
+            normalized.append({
+                'token_id': str((item or {}).get('token_id', '')).strip() or self.make_id('tok'),
+                'token_hash': token_hash,
+                'created_at': str((item or {}).get('created_at', '')).strip(),
+                'expires_at': expires_at,
+                'last_seen_at': str((item or {}).get('last_seen_at', '')).strip(),
+                'revoked_at': '',
+            })
+        normalized.sort(key=lambda entry: entry.get('created_at', ''), reverse=True)
+        return normalized[:10]
 
     def _normalize_profiles(self, items: Any) -> list[dict]:
         normalized: list[dict] = []
@@ -554,6 +688,7 @@ class Storage:
                 'approved_at': str(item.get('approved_at', '')),
                 'approved_by_user_id': str(item.get('approved_by_user_id', '')).strip(),
                 'force_password_change': bool(item.get('force_password_change', False)),
+                'auth_tokens': self._normalize_auth_tokens(item.get('auth_tokens', []) or []),
             })
         return normalized
 
