@@ -321,6 +321,40 @@ class Storage:
             items = [item for item in self.get_jobs(include_pending=True) if item.get('id') != job_id]
             self._write_json(self.jobs_path, items)
 
+    def bulk_upsert_jobs(self, payloads: list[dict]) -> int:
+        with self._lock:
+            items = self.get_jobs(include_pending=True)
+            by_id = {str(item.get('id', '')).strip(): index for index, item in enumerate(items)}
+            count = 0
+            for normalized in self._normalize_jobs(payloads):
+                job_id = str(normalized.get('id', '')).strip()
+                if not job_id:
+                    continue
+                if job_id in by_id:
+                    items[by_id[job_id]] = normalized
+                else:
+                    by_id[job_id] = len(items)
+                    items.append(normalized)
+                count += 1
+            if count:
+                self._write_json(self.jobs_path, items)
+            return count
+
+    def bulk_update_jobs(self, patches_by_id: dict[str, dict]) -> int:
+        with self._lock:
+            if not patches_by_id:
+                return 0
+            items = self.get_jobs(include_pending=True)
+            changed = 0
+            for index, item in enumerate(items):
+                job_id = str(item.get('id', '')).strip()
+                if job_id and job_id in patches_by_id:
+                    items[index] = self._normalize_jobs([item | (patches_by_id[job_id] or {})])[0]
+                    changed += 1
+            if changed:
+                self._write_json(self.jobs_path, items)
+            return changed
+
     def find_duplicate_job(self, company: str, job_title: str, exclude_job_id: str = '') -> dict | None:
         company_key = _job_compare_key(company)
         title_key = _job_compare_key(job_title)

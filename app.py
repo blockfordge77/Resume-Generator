@@ -1730,7 +1730,7 @@ def _parse_batch_jobs(text: str, user: dict) -> list[dict]:
         company = ''
         job_title = ''
         note = ''
-        region = 'ANY'
+        region = 'US'
         if len(parts) >= 3 and parts[2].startswith('http'):
             company = parts[0]
             job_title = parts[1]
@@ -1777,6 +1777,30 @@ def _parse_batch_jobs(text: str, user: dict) -> list[dict]:
     return jobs
 
 
+def _job_scrape_progress_scope(user: dict) -> list[dict]:
+    jobs = storage.get_jobs(include_pending=True)
+    if is_admin(user):
+        return [job for job in jobs if job.get('status') == 'pending']
+    return [
+        job for job in jobs
+        if job.get('status') == 'pending' and job.get('created_by_user_id') == user.get('id', '')
+    ]
+
+
+def _render_job_scrape_progress(user: dict, title: str = 'Background scrape progress') -> None:
+    scoped_jobs = _job_scrape_progress_scope(user)
+    queued = sum(1 for job in scoped_jobs if job.get('scrape_status') == 'queued')
+    processing = sum(1 for job in scoped_jobs if job.get('scrape_status') == 'processing')
+    done = sum(1 for job in scoped_jobs if job.get('scrape_status') == 'done')
+    errors = sum(1 for job in scoped_jobs if job.get('scrape_status') == 'error')
+    total = len(scoped_jobs)
+    if total == 0:
+        st.caption('No pending background scraping jobs.')
+        return
+    st.caption(f"{title}: {done} done • {processing} processing • {queued} queued • {errors} errors")
+    st.progress((done + errors) / total if total else 0.0, text=f'{done + errors} of {total} completed')
+
+
 def job_list_page(user: dict) -> None:
     show_header(user)
     st.subheader('Job List')
@@ -1795,7 +1819,7 @@ def job_list_page(user: dict) -> None:
     if notice:
         st.success(notice)
 
-    tabs = ['Approved jobs', 'Add job', 'Batch presave'] + (['Pending admin queue'] if is_admin(user) else [])
+    tabs = ['Approved jobs', 'Add job'] + (['Batch presave', 'Pending admin queue'] if is_admin(user) else [])
     rendered_tabs = st.tabs(tabs)
 
     with rendered_tabs[0]:
@@ -1848,7 +1872,7 @@ def job_list_page(user: dict) -> None:
             with c_add1:
                 link = st.text_input('Link')
             with c_add2:
-                region = st.selectbox('Job market', REGION_OPTIONS, index=0)
+                region = st.selectbox('Job market', REGION_OPTIONS, index=REGION_OPTIONS.index('US'))
             description = st.text_area('Job description', height=220)
             note = st.text_area('Note', height=100)
             confirm_duplicate = st.checkbox('I confirm I still want to add this if the same company and role already exist')
@@ -1883,22 +1907,42 @@ def job_list_page(user: dict) -> None:
             st.session_state['job_list_notice'] = 'Job saved.' if status == 'approved' else 'Job submitted for admin approval.'
             st.rerun()
 
-    with rendered_tabs[2]:
-        st.caption('Paste one job per line. Supported formats: URL only, Company | Role | URL | Note, or Company | Role | URL | Region | Note')
-        batch_text = st.text_area('Batch job input', height=220, key='batch_jobs_text')
-        if st.button('Presave batch jobs', type='primary', use_container_width=True):
-            jobs = _parse_batch_jobs(batch_text, user)
-            if not jobs:
-                st.error('Paste at least one job line first.')
-            else:
-                for job in jobs:
-                    storage.upsert_job(job)
-                st.session_state['job_list_notice'] = f'{len(jobs)} job entries queued for admin review.'
-                st.rerun()
-
     if is_admin(user):
+        with rendered_tabs[2]:
+            st.caption('Paste one job per line. Supported formats: URL only, Company | Role | URL | Note, or Company | Role | URL | Region | Note. Default market is US when not provided.')
+            _render_job_scrape_progress(user)
+            batch_text = st.text_area('Batch job input', height=220, key='batch_jobs_text')
+            if st.button('Queue batch jobs', type='primary', use_container_width=True):
+                jobs = _parse_batch_jobs(batch_text, user)
+                if not jobs:
+                    st.error('Paste at least one job line first.')
+                else:
+                    storage.bulk_upsert_jobs(jobs)
+                    st.session_state['job_list_notice'] = f'{len(jobs)} job entries queued for background scraping and admin review.'
+                    st.rerun()
+
         with rendered_tabs[3]:
             pending_jobs = [job for job in storage.get_jobs(include_pending=True) if job.get('status') == 'pending']
+            header_col, action_col = st.columns([4.5, 1.5])
+            with header_col:
+                _render_job_scrape_progress(user, title='Pending queue progress')
+            with action_col:
+                st.write('')
+                st.write('')
+                if pending_jobs and st.button('Approve all job lists', type='primary', use_container_width=True):
+                    approve_patch = {}
+                    approved_at = datetime.utcnow().isoformat() + 'Z'
+                    for job in pending_jobs:
+                        approve_patch[job.get('id', '')] = {
+                            'status': 'approved',
+                            'approved_at': approved_at,
+                            'approved_by_user_id': user.get('id', ''),
+                            'approved_by_username': user.get('username', ''),
+                            'scrape_status': 'done' if str(job.get('description', '')).strip() else job.get('scrape_status', 'queued'),
+                        }
+                    storage.bulk_update_jobs(approve_patch)
+                    st.session_state['job_list_notice'] = f'{len(approve_patch)} pending jobs approved.'
+                    st.rerun()
             if not pending_jobs:
                 st.info('No pending jobs to review.')
             for job in pending_jobs:
@@ -1918,7 +1962,7 @@ def job_list_page(user: dict) -> None:
                         st.session_state[link_key] = job.get('link', '')
                         st.session_state[note_key] = job.get('note', '')
                         st.session_state[desc_key] = job.get('description', '')
-                        st.session_state[region_key] = _region_label(job.get('region', 'ANY'))
+                        st.session_state[region_key] = _region_label(job.get('region', 'US'))
                     st.text_input('Company', key=company_key)
                     st.text_input('Job title', key=title_key)
                     st.text_input('Link', key=link_key)
@@ -1928,17 +1972,17 @@ def job_list_page(user: dict) -> None:
                     c1, c2, c3, c4 = st.columns(4)
                     with c1:
                         if st.button('Save draft', key=f"save_pending_{job.get('id')}", use_container_width=True):
-                            storage.update_job(job.get('id', ''), {'company': st.session_state.get(company_key, ''), 'job_title': st.session_state.get(title_key, ''), 'link': st.session_state.get(link_key, ''), 'region': _normalize_region(st.session_state.get(region_key, 'ANY')), 'description': st.session_state.get(desc_key, ''), 'note': st.session_state.get(note_key, '')})
+                            storage.update_job(job.get('id', ''), {'company': st.session_state.get(company_key, ''), 'job_title': st.session_state.get(title_key, ''), 'link': st.session_state.get(link_key, ''), 'region': _normalize_region(st.session_state.get(region_key, 'US')), 'description': st.session_state.get(desc_key, ''), 'note': st.session_state.get(note_key, '')})
                             st.success('Pending job updated.')
                             st.rerun()
                     with c2:
                         if st.button('Approve', key=f"approve_pending_{job.get('id')}", type='primary', use_container_width=True):
-                            storage.update_job(job.get('id', ''), {'company': st.session_state.get(company_key, ''), 'job_title': st.session_state.get(title_key, ''), 'link': st.session_state.get(link_key, ''), 'region': _normalize_region(st.session_state.get(region_key, 'ANY')), 'description': st.session_state.get(desc_key, ''), 'note': st.session_state.get(note_key, ''), 'status': 'approved', 'approved_at': datetime.utcnow().isoformat() + 'Z', 'approved_by_user_id': user.get('id', ''), 'approved_by_username': user.get('username', ''), 'scrape_status': 'done' if st.session_state.get(desc_key, '').strip() else job.get('scrape_status', 'queued')})
+                            storage.update_job(job.get('id', ''), {'company': st.session_state.get(company_key, ''), 'job_title': st.session_state.get(title_key, ''), 'link': st.session_state.get(link_key, ''), 'region': _normalize_region(st.session_state.get(region_key, 'US')), 'description': st.session_state.get(desc_key, ''), 'note': st.session_state.get(note_key, ''), 'status': 'approved', 'approved_at': datetime.utcnow().isoformat() + 'Z', 'approved_by_user_id': user.get('id', ''), 'approved_by_username': user.get('username', ''), 'scrape_status': 'done' if st.session_state.get(desc_key, '').strip() else job.get('scrape_status', 'queued')})
                             st.success('Job approved and visible to all users.')
                             st.rerun()
                     with c3:
                         if st.button('Requeue scrape', key=f"requeue_pending_{job.get('id')}", use_container_width=True):
-                            storage.update_job(job.get('id', ''), {'company': st.session_state.get(company_key, ''), 'job_title': st.session_state.get(title_key, ''), 'link': st.session_state.get(link_key, ''), 'region': _normalize_region(st.session_state.get(region_key, 'ANY')), 'note': st.session_state.get(note_key, ''), 'description': st.session_state.get(desc_key, ''), 'scrape_status': 'queued', 'scrape_error': ''})
+                            storage.update_job(job.get('id', ''), {'company': st.session_state.get(company_key, ''), 'job_title': st.session_state.get(title_key, ''), 'link': st.session_state.get(link_key, ''), 'region': _normalize_region(st.session_state.get(region_key, 'US')), 'note': st.session_state.get(note_key, ''), 'description': st.session_state.get(desc_key, ''), 'scrape_status': 'queued', 'scrape_error': ''})
                             st.success('Job queued for background scraping.')
                             st.rerun()
                     with c4:
