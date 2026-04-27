@@ -3,3 +3,7 @@ saved_resumes
 data
 __pycache__/
 .env
+LOG
+resume.config.js
+company_message.txt
+metadata.json

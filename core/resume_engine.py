@@ -624,6 +624,12 @@ def _generate_with_openai(profile: dict, job_description: str, target_role: str,
     client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
     model = os.getenv('OPENAI_MODEL', 'gpt-5.4')
 
+    work_history_count = len(profile.get('work_history', []) or [])
+    bullet_targets = ', '.join(
+        f"company {idx + 1} = {_target_bullet_count(idx, work_history_count)} bullets"
+        for idx in range(work_history_count)
+    ) or 'each company 5 to 9 bullets'
+
     developer_message = (
         'You are a senior resume writer and ATS optimizer. Build the resume from a clean slate every time. '
         'Do not rely on previous resumes, previous generations, examples, or any historical context outside the current request payload. '
@@ -637,8 +643,11 @@ def _generate_with_openai(profile: dict, job_description: str, target_role: str,
         'The role_title and headline do not need to be generic software engineer titles. They may be Machine Learning Engineer, DevOps Engineer, Platform Engineer, Data Engineer, Backend Engineer, Frontend Engineer, Full Stack Engineer, or another job-aligned title when supported by the evidence. '
         'Make the overall headline and each company role_title sharply aligned to the core function of the job description. '
         'Stay as truthful as possible to the profile bullets and companies, but make the resume highly technical and job-focused. '
-        'Each company should have at least 4 strong bullets. Most bullets should name exact relevant technologies from the analyzed stack. '
-        'Avoid generic wording such as modern tools, backend services, cloud-based systems, or web technologies when exact stacks are available. '
+        'Bullet rules (must follow exactly): every company has between 5 and 9 distinct bullets; the most recent company has 7 to 9 bullets; older companies have at least 5; '
+        f'use these per-company bullet targets: {bullet_targets}; '
+        'no two bullets across the resume share the same opening verb, the same wording, or the same sentence structure; each bullet describes a distinct responsibility, problem, or outcome and names exact technologies from the analyzed stack. '
+        'Forbidden generic openings or filler include: "Delivered production work across", "Collaborated with product and engineering stakeholders", "Strengthened reliability and delivery confidence", "Contributed as a ... in a fast-moving environment", "modern tools", "backend services", "cloud-based systems", "web technologies", and any sentence whose only technical content is a comma-separated tech list. '
+        'Vary verbs across bullets (own, design, ship, build, migrate, harden, instrument, refactor, mentor, lead, automate, optimize, integrate, debug, profile, partner). '
         'If validation feedback is provided, fix every issue and regenerate the full resume so it passes the validation requirements. '
         'Return only JSON that matches the schema.'
     )
@@ -653,6 +662,10 @@ def _generate_with_openai(profile: dict, job_description: str, target_role: str,
         'clean_generation': clean_generation,
         'job_tech_analysis': job_tech_analysis or _analyze_job_tech_stack(job_description, target_role=target_role),
         'validation_feedback': validation_feedback,
+        'bullet_targets_per_company': [
+            {'index': idx, 'target_bullets': _target_bullet_count(idx, work_history_count)}
+            for idx in range(work_history_count)
+        ],
     }
 
     response = client.responses.create(
@@ -682,13 +695,23 @@ def _update_with_openai(profile: dict, job_description: str, current_resume: dic
     client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
     model = os.getenv('OPENAI_MODEL', 'gpt-5.4')
 
+    job_tech_analysis = _analyze_job_tech_stack(job_description, target_role=target_role)
+    work_history_count = len(profile.get('work_history', []) or current_resume.get('work_history', []))
+    bullet_targets = ', '.join(
+        f"company {idx + 1} = {_target_bullet_count(idx, work_history_count)} bullets"
+        for idx in range(work_history_count)
+    ) or 'each company 5 to 9 bullets'
+
     developer_message = (
         'You are revising an existing generated resume. Treat every request as isolated. '
         'Do not use any prior conversation context, prior drafts, or prior generations outside the current payload. '
         'Use only the current profile, current job description, current resume draft, current target role, and the user fix request. '
         'Stay strictly truthful to the profile. Do not invent companies, dates, scope, responsibilities, metrics, certifications, or technologies that are not supported by the profile. '
-        'Preserve the strengths of the current draft unless the fix request clearly asks to change them. '
-        'Apply the fix request precisely. '
+        'Preserve the strengths of the current draft unless the fix request clearly asks to change them, but always apply the fix request precisely. '
+        'Every company must have between 5 and 9 distinct bullets. The most recent company should have 7 to 9 bullets, and older companies should have at least 5. '
+        f'Use these per-company bullet targets when nothing in the fix request says otherwise: {bullet_targets}. '
+        'No two bullets across the whole resume may share the same opening verb or repeat the same wording. Each bullet must describe a different responsibility, problem, or outcome. '
+        'Avoid generic filler such as "delivered production work", "collaborated with stakeholders", "strengthened reliability and delivery confidence", or "contributed in a fast-moving environment". '
         'When improving bullets, prefer exact named technologies from the job description when those technologies are supported by the profile evidence. '
         'Keep headline, summary, skill groups, and company role titles sharply aligned to the job description. '
         'Return the full revised resume in the required JSON schema, not a partial patch.'
@@ -704,8 +727,11 @@ def _update_with_openai(profile: dict, job_description: str, current_resume: dic
         'custom_prompt': custom_prompt,
         'effective_prompt': _compose_prompt_guidance(default_prompt, custom_prompt),
         'clean_generation': clean_generation,
-        'job_tech_analysis': job_tech_analysis or _analyze_job_tech_stack(job_description, target_role=target_role),
-        'validation_feedback': validation_feedback,
+        'job_tech_analysis': job_tech_analysis,
+        'bullet_targets_per_company': [
+            {'index': idx, 'target_bullets': _target_bullet_count(idx, work_history_count)}
+            for idx in range(work_history_count)
+        ],
     }
 
     response = client.responses.create(
@@ -744,20 +770,25 @@ def _generate_demo_resume(profile: dict, job_description: str, target_role: str,
     headline = _infer_resume_headline(inferred_title, prioritized_skills)
 
     work_history = []
-    for idx, item in enumerate(profile.get('work_history', [])):
+    profile_history = profile.get('work_history', [])
+    total_jobs = len(profile_history)
+    for idx, item in enumerate(profile_history):
         company_keywords = _keywords_for_company(item, extracted_keywords + expanded_stack[:18], profile_skills + expanded_stack) or expanded_stack[:6]
         role_title = _company_role_title(inferred_title, idx)
         role_headline = _build_role_headline(company_keywords, item.get('bullets', []), role_title)
-        bullets = _tailored_bullets(item.get('bullets', []), company_keywords, prioritized_skills)
-        if len(bullets) < 4:
-            bullets.extend(_fallback_bullets_for_role(role_title, company_keywords or expanded_stack[:5], 4 - len(bullets)))
+        bullets = _dedupe_bullets(_tailored_bullets(item.get('bullets', []), company_keywords, prioritized_skills))
+        target = _target_bullet_count(idx, total_jobs)
+        if len(bullets) < target:
+            fallback_pool = _dedupe_preserve_order(list(company_keywords) + list(prioritized_skills) + list(expanded_stack))[:9]
+            extra = _fallback_bullets_for_role(role_title, fallback_pool or expanded_stack[:5], target - len(bullets), company_name=item.get('company_name', ''), index=idx)
+            bullets = _dedupe_bullets(bullets + extra)
         work_history.append({
             'company_name': item.get('company_name', ''),
             'role_title': role_title,
             'role_headline': role_headline,
             'duration': item.get('duration', ''),
             'location': item.get('location', ''),
-            'bullets': bullets[:6],
+            'bullets': bullets[:9],
         })
 
     summary = _build_summary(profile, inferred_title, prioritized_skills[:10], effective_prompt)
@@ -787,12 +818,18 @@ def _update_demo_resume(profile: dict, job_description: str, current_resume: dic
     fix_lower = (fix_prompt or '').lower()
     inferred_title = _infer_target_title(target_role, extracted_keywords, profile.get('technical_skills', []) + expanded_stack)
 
-    for job in updated.get('work_history', []):
+    work_history = updated.get('work_history', [])
+    total_jobs = len(work_history)
+    for idx, job in enumerate(work_history):
         company_keywords = _keywords_for_company(job, extracted_keywords + expanded_stack[:18], profile.get('technical_skills', []) + expanded_stack) or prioritized_skills[:5]
-        job['bullets'] = _tailored_bullets(job.get('bullets', []), company_keywords, prioritized_skills)[:6]
-        if len(job['bullets']) < 4:
-            job['bullets'].extend(_fallback_bullets_for_role(job.get('role_title', inferred_title), company_keywords, 4 - len(job['bullets'])))
-        job['role_headline'] = _build_role_headline(company_keywords, job.get('bullets', []), job.get('role_title', ''))
+        bullets = _dedupe_bullets(_tailored_bullets(job.get('bullets', []), company_keywords, prioritized_skills))
+        target = _target_bullet_count(idx, total_jobs)
+        if len(bullets) < target:
+            fallback_pool = _dedupe_preserve_order(list(company_keywords) + list(prioritized_skills) + list(expanded_stack))[:9]
+            extra = _fallback_bullets_for_role(job.get('role_title', inferred_title), fallback_pool, target - len(bullets), company_name=job.get('company_name', ''), index=idx)
+            bullets = _dedupe_bullets(bullets + extra)
+        job['bullets'] = bullets[:9]
+        job['role_headline'] = _build_role_headline(company_keywords, job['bullets'], job.get('role_title', ''))
 
     if any(term in fix_lower for term in ['summary', 'headline', 'rewrite', 'sharper', 'tailor', 'tech', 'stack', 'keyword', 'specific', 'exact']):
         updated['headline'] = _infer_resume_headline(inferred_title, updated.get('technical_skills', []) or prioritized_skills)
@@ -935,19 +972,29 @@ def _normalize_resume(resume: dict, profile: dict, target_role: str, job_descrip
     expanded_stack = tech_analysis.get('expanded_techs', [])
     inferred_title = _infer_target_title(target_role, extracted, profile.get('technical_skills', []) + expanded_stack)
     normalized_history = []
+    total_jobs = len(source_history)
+    seen_bullet_keys: set[str] = set()
     for index, source_job in enumerate(source_history):
         item = generated[index] if index < len(generated) else {}
-        bullets = [str(bullet).strip() for bullet in item.get('bullets', source_job.get('bullets', [])) if str(bullet).strip()]
-        if len(bullets) < 4:
-            company_keywords = _keywords_for_company(source_job, extracted + expanded_stack[:18], profile.get('technical_skills', []) + expanded_stack) or expanded_stack[:5]
-            bullets.extend(_fallback_bullets_for_role(item.get('role_title') or _company_role_title(inferred_title, index), company_keywords, 4 - len(bullets)))
+        bullets = _dedupe_bullets(item.get('bullets', source_job.get('bullets', [])))
+        bullets = [b for b in bullets if b.lower().rstrip('.') not in seen_bullet_keys]
+        target = _target_bullet_count(index, total_jobs)
+        company_keywords = _keywords_for_company(source_job, extracted + expanded_stack[:18], profile.get('technical_skills', []) + expanded_stack) or expanded_stack[:5]
+        if len(bullets) < target:
+            fallback_pool = _dedupe_preserve_order(list(company_keywords) + list(expanded_stack) + list(profile.get('technical_skills', [])))[:9]
+            extra = _fallback_bullets_for_role(item.get('role_title') or _company_role_title(inferred_title, index), fallback_pool, target - len(bullets), company_name=source_job.get('company_name', ''), index=index)
+            extra = [b for b in extra if b.lower().rstrip('.') not in seen_bullet_keys and b.lower().rstrip('.') not in {x.lower().rstrip('.') for x in bullets}]
+            bullets = _dedupe_bullets(bullets + extra)
+        bullets = bullets[:9]
+        for bullet in bullets:
+            seen_bullet_keys.add(bullet.lower().rstrip('.'))
         normalized_history.append({
             'company_name': item.get('company_name') or source_job.get('company_name', ''),
             'role_title': item.get('role_title') or _company_role_title(inferred_title, index),
             'role_headline': item.get('role_headline') or '',
             'duration': item.get('duration') or source_job.get('duration', ''),
             'location': item.get('location') or source_job.get('location', ''),
-            'bullets': bullets[:6],
+            'bullets': bullets,
         })
 
     flat_skills = _dedupe_preserve_order(resume.get('technical_skills', []))
@@ -1297,15 +1344,101 @@ def _expand_related_techs(seed_techs: list[str], role_family: str, keywords: lis
     return ordered[:maximum]
 
 
-def _fallback_bullets_for_role(role_title: str, techs: list[str], needed: int) -> list[str]:
-    tech_phrase = ', '.join((techs or [])[:4]) or 'production tooling'
-    templates = [
-        f'Delivered production work across {tech_phrase} with a focus on maintainability, release quality, and clear ownership.',
-        f'Collaborated with product and engineering stakeholders to scope, implement, and iterate on features tied to {tech_phrase}.',
-        f'Strengthened reliability and delivery confidence by improving code paths, test coverage, and rollout practices around {tech_phrase}.',
-        f'Contributed as a {role_title or "Software Engineer"} in a fast-moving environment where exact stack choices such as {tech_phrase} mattered to delivery.'
+def _target_bullet_count(index: int, total: int) -> int:
+    """Return how many bullets a company at the given index should carry.
+
+    Most recent company gets the richest detail (8 bullets), with older roles
+    tapering down. Always within a 5 to 9 envelope so the resume stays
+    flexible per the user requirements.
+    """
+    if total <= 0:
+        return 5
+    if index == 0:
+        return 8
+    if index == 1:
+        return 7
+    if index == 2:
+        return 6
+    return 5
+
+
+def _dedupe_bullets(bullets: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    for bullet in bullets or []:
+        clean = ' '.join(str(bullet).split()).strip()
+        if not clean:
+            continue
+        key = clean.lower().rstrip('.')
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(clean)
+    return unique
+
+
+def _fallback_bullets_for_role(role_title: str, techs: list[str], needed: int, company_name: str = '', index: int = 0) -> list[str]:
+    if needed <= 0:
+        return []
+    raw = [str(t).strip() for t in (techs or []) if str(t).strip()]
+    # Dedupe while preserving order so adjacent template slots cannot read
+    # like "IAM and IAM".
+    seen: set[str] = set()
+    techs_clean: list[str] = []
+    for tech in raw:
+        key = tech.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        techs_clean.append(tech)
+    if not techs_clean:
+        techs_clean = ['production tooling']
+    # Rotate the tech list by company index so each company leads with a
+    # different stack flavor; this multiplies bullet diversity even when the
+    # template bank repeats.
+    if len(techs_clean) > 1:
+        offset = index % len(techs_clean)
+        techs_clean = techs_clean[offset:] + techs_clean[:offset]
+    primary = ', '.join(techs_clean[:3])
+    secondary = ', '.join(techs_clean[3:6]) if len(techs_clean) > 3 else primary
+    tertiary = ', '.join(techs_clean[6:9]) if len(techs_clean) > 6 else secondary
+    lead = techs_clean[0]
+    second = techs_clean[1] if len(techs_clean) > 1 else lead
+    third = techs_clean[2] if len(techs_clean) > 2 else second
+    role = role_title.strip() or 'Software Engineer'
+    role_lower = role.lower()
+    company = company_name.strip() or 'the team'
+
+    bank = [
+        f'Owned {role_lower} delivery on {primary}, partnering with product to ship features end to end.',
+        f'Designed and shipped {lead}-driven services with tested {second} integrations and {third} support across the {company} stack.',
+        f'Operated production workloads on {secondary}, hardening reliability with monitoring, alerting, and disciplined rollouts.',
+        f'Built CI/CD and developer tooling around {tertiary} to shorten lead time and de-risk releases.',
+        f'Refactored {lead} integration paths and grew test coverage on {second}, cutting regressions across release cycles.',
+        f'Mentored teammates on {primary} patterns through code reviews, design docs, and pairing on tougher delivery slices.',
+        f'Investigated and resolved production incidents touching {secondary}, capturing learnings into playbooks and dashboards.',
+        f'Drove cross-team alignment on {primary} architecture, balancing delivery speed with long-term maintainability.',
+        f'Led performance work on {lead} and {second}, profiling hot paths and rolling out throughput-sensitive optimizations.',
+        f'Migrated legacy components onto {primary}, preserving behavior with characterization tests and gradual cutovers.',
+        f'Hardened security posture for {lead} and {third} surfaces with secrets management, IAM tightening, and automated scans.',
+        f'Instrumented {primary} with structured logging and metrics so on-call could triage issues without paging the owning team.',
+        f'Partnered with data and platform teams to standardize {secondary} interfaces, removing one-off integrations and review churn.',
+        f'Championed code-quality and review standards across {lead} and {second}, reducing rework on shipped changes.',
+        f'Automated repetitive {tertiary} workflows with scripts and pipelines, freeing engineering time for higher-leverage work.',
+        f'Scaled {lead} throughput by tuning {second} configuration, batching strategies, and back-pressure handling.',
+        f'Wrote durable runbooks for {primary} so new engineers could ship and operate confidently from day one.',
+        f'Reviewed and approved high-impact changes touching {secondary}, defending product quality without slowing the team.',
+        f'Built end-to-end tests around {lead} and {third} flows, catching regressions before they reached customers.',
+        f'Owned upgrades for {lead} and {second} dependencies, sequencing breaking changes safely across services.',
+        f'Cut cloud spend on {primary} by right-sizing resources, enforcing budgets, and removing unused infrastructure.',
+        f'Co-designed APIs across {lead} and {third} so partner teams could integrate without ad-hoc workarounds.',
     ]
-    return templates[:max(0, needed)]
+    # Step coprime to len(bank) (22) so rotation keeps each company's window
+    # genuinely different from the others.
+    step = 7
+    rotation = (index * step) % len(bank)
+    rotated = bank[rotation:] + bank[:rotation]
+    return rotated[:needed]
 
 
 def _resume_meets_generation_requirements(resume: dict, job_tech_analysis: dict) -> dict:
@@ -1318,16 +1451,24 @@ def _resume_meets_generation_requirements(resume: dict, job_tech_analysis: dict)
     missing_required_techs = [skill for skill in required_stack if skill.lower() not in actual_lookup]
 
     work_history = resume.get('work_history', []) or []
+    total_jobs = len(work_history)
     bullet_gaps: list[str] = []
     total_bullets = 0
     tech_bullets = 0
-    for job in work_history:
+    seen_bullet_keys: set[str] = set()
+    duplicate_bullets = 0
+    for idx, job in enumerate(work_history):
         bullets = [str(b).strip() for b in job.get('bullets', []) if str(b).strip()]
         total_bullets += len(bullets)
-        if len(bullets) < 4:
-            bullet_gaps.append(f"{job.get('company_name', 'A role')} has fewer than 4 bullets.")
+        target = _target_bullet_count(idx, total_jobs)
+        if len(bullets) < target:
+            bullet_gaps.append(f"{job.get('company_name', 'A role')} has {len(bullets)} bullets; expected at least {target}.")
         for bullet in bullets:
             lower = bullet.lower()
+            key = lower.rstrip('.')
+            if key in seen_bullet_keys:
+                duplicate_bullets += 1
+            seen_bullet_keys.add(key)
             if any(skill.lower() in lower for skill in required_stack[:24]) or any(skill.lower() in lower for skill in KNOWN_TECH_TERMS):
                 tech_bullets += 1
     bullet_ratio = (tech_bullets / total_bullets) if total_bullets else 0.0
@@ -1335,14 +1476,22 @@ def _resume_meets_generation_requirements(resume: dict, job_tech_analysis: dict)
         bullet_gaps.append('No bullets were returned in work history.')
     elif bullet_ratio < 0.65:
         bullet_gaps.append('Too many bullets still use generic wording instead of named technologies.')
+    if duplicate_bullets > 0:
+        bullet_gaps.append(f'{duplicate_bullets} bullet(s) duplicate wording across companies; rewrite each to be unique.')
 
-    ok = 40 <= len(technical_skills) <= 50 and not bullet_gaps and len(missing_required_techs) <= 8
+    ok = (
+        40 <= len(technical_skills) <= 50
+        and not bullet_gaps
+        and len(missing_required_techs) <= 8
+        and duplicate_bullets == 0
+    )
     return {
         'ok': ok,
         'skills_count': len(technical_skills),
         'missing_required_techs': missing_required_techs,
         'bullet_gaps': bullet_gaps,
         'bullet_ratio': round(bullet_ratio, 2),
+        'duplicate_bullets': duplicate_bullets,
     }
 
 
