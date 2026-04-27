@@ -18,7 +18,7 @@ from urllib import request as urlrequest
 import streamlit as st
 from dotenv import load_dotenv
 
-from core.export_engine import build_export_bundle
+from core.docx_resume_export import build_docx_style_pdf_bundle, default_backend_order, pdf_backend_status
 from core.resume_engine import (
     analyze_ats_score,
     generate_application_answers,
@@ -27,7 +27,6 @@ from core.resume_engine import (
     update_resume_content,
 )
 from core.storage import Storage, build_password_record, verify_password
-from core.template_engine import render_resume_html
 
 load_dotenv()
 
@@ -74,10 +73,94 @@ def _profile_matches_selected_job_region(profile: dict, selected_job_id: str, se
     return _regions_match(profile.get('region', ''), selected_job_region)
 
 
+def _profile_resume_upload_dir(profile_id: str) -> Path:
+    return APP_DIR / 'data' / 'profile_resumes' / str(profile_id or '').strip()
+
+
+def _uploaded_resume_candidate_paths(profile: dict) -> list[Path]:
+    upload = profile.get('uploaded_resume') if isinstance(profile.get('uploaded_resume'), dict) else {}
+    profile_id = str(profile.get('id', '') or '').strip()
+    candidates: list[Path] = []
+
+    for key in ('path', 'storage_path'):
+        raw = str(upload.get(key, '') or '').strip()
+        if not raw:
+            continue
+        path = Path(raw).expanduser()
+        candidates.append(path if path.is_absolute() else APP_DIR / 'data' / path)
+
+    relative_path = str(upload.get('relative_path', '') or '').strip()
+    if relative_path:
+        candidates.append(APP_DIR / 'data' / relative_path)
+
+    filename = str(upload.get('filename', '') or '').strip()
+    if profile_id and filename:
+        safe_name = re.sub(r'[^A-Za-z0-9_.-]+', '_', filename).strip('._') or 'resume.docx'
+        candidates.append(_profile_resume_upload_dir(profile_id) / safe_name)
+
+    if profile_id:
+        upload_dir = _profile_resume_upload_dir(profile_id)
+        if upload_dir.exists():
+            candidates.extend(sorted(upload_dir.glob('*.docx'), key=lambda item: item.stat().st_mtime, reverse=True))
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(candidate)
+    return unique
+
+
+def _resolve_uploaded_resume_path(profile: dict) -> Path | None:
+    for candidate in _uploaded_resume_candidate_paths(profile):
+        try:
+            if candidate.exists() and candidate.is_file() and candidate.suffix.lower() == '.docx':
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def _relative_data_path(path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to((APP_DIR / 'data').resolve()))
+    except Exception:
+        return ''
+
+
+def _resolved_uploaded_resume_record(profile: dict) -> dict:
+    upload = copy.deepcopy(profile.get('uploaded_resume') if isinstance(profile.get('uploaded_resume'), dict) else {})
+    path = _resolve_uploaded_resume_path(profile)
+    if not path:
+        return upload if upload else {}
+    upload['path'] = str(path)
+    relative_path = _relative_data_path(path)
+    if relative_path:
+        upload['relative_path'] = relative_path
+    upload['filename'] = str(upload.get('filename', '') or path.name)
+    try:
+        upload['size_bytes'] = int(path.stat().st_size)
+    except OSError:
+        upload['size_bytes'] = int(upload.get('size_bytes', 0) or 0)
+    upload.setdefault('content_type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+    upload.setdefault('uploaded_at', '')
+    upload.setdefault('extracted_text', '')
+    return upload
+
+
+def _profile_resume_status(profile: dict) -> str:
+    return 'resume uploaded' if _resolve_uploaded_resume_path(profile) else 'no resume'
+
+
+def _profile_has_uploaded_resume(profile: dict) -> bool:
+    return _resolve_uploaded_resume_path(profile) is not None
+
+
 def _format_profile_option(item: dict) -> str:
     name = item.get('name', 'Unnamed profile')
-    return f"{name} [{_region_label(item.get('region', ''))}]"
-
+    return f"{name} [{_region_label(item.get('region', ''))}] - {_profile_resume_status(item)}"
 
 def _format_job_option(item: dict) -> str:
     if not item.get('id'):
@@ -102,7 +185,7 @@ def init_state() -> None:
         'last_target_role': '',
         'last_custom_prompt': '',
         'last_bold_keywords': '',
-        'last_auto_bold_fit_keywords': True,
+        'last_auto_bold_fit_keywords': False,
         'last_update_prompt': '',
         'editor_loaded_signature': '',
         'editor_pending_resume': None,
@@ -737,6 +820,74 @@ def _open_file_default(path_value: str) -> tuple[bool, str]:
         return False, str(exc)
 
 
+def _extract_docx_text(path: Path) -> str:
+    try:
+        from docx import Document
+        doc = Document(str(path))
+    except Exception:
+        return ''
+    parts: list[str] = []
+    for paragraph in doc.paragraphs:
+        value = paragraph.text.strip()
+        if value:
+            parts.append(value)
+    for table in doc.tables:
+        for row in table.rows:
+            cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+            if cells:
+                parts.append(' | '.join(cells))
+    return '\n'.join(parts).strip()
+
+
+def _save_uploaded_resume_docx(profile_id: str, uploaded_file) -> dict:
+    if uploaded_file is None:
+        return {}
+    filename = str(getattr(uploaded_file, 'name', '') or 'resume.docx').strip()
+    if not filename.lower().endswith('.docx'):
+        raise ValueError('Only DOCX resume upload is supported.')
+    safe_name = re.sub(r'[^A-Za-z0-9_.-]+', '_', filename).strip('._') or 'resume.docx'
+    upload_dir = _profile_resume_upload_dir(profile_id)
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    target_path = upload_dir / safe_name
+    data = uploaded_file.getvalue()
+    target_path.write_bytes(data)
+    relative_path = _relative_data_path(target_path)
+    return {
+        'filename': filename,
+        'content_type': str(getattr(uploaded_file, 'type', '') or 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'),
+        'size_bytes': len(data),
+        'path': str(target_path),
+        'relative_path': relative_path,
+        'uploaded_at': datetime.utcnow().isoformat() + 'Z',
+        'extracted_text': _extract_docx_text(target_path),
+    }
+
+
+def _pdf_export_config(settings: dict) -> dict:
+    order_raw = str(settings.get('pdf_backend_order', '') or '').strip()
+    backend_order = [item.strip() for item in order_raw.split(',') if item.strip()]
+    if not backend_order:
+        backend_order = default_backend_order()
+    return {
+        'backend_order': backend_order,
+        'wps_pdf_command': str(settings.get('wps_pdf_command', '') or '').strip(),
+    }
+
+
+def _build_uploaded_docx_pdf_exports(resume: dict, profile: dict, app_settings: dict) -> dict:
+    resolved_upload = _resolved_uploaded_resume_record(profile)
+    if not resolved_upload or not Path(str(resolved_upload.get('path', ''))).exists():
+        raise FileNotFoundError('no resume so must upload resume')
+    export_profile = copy.deepcopy(profile)
+    export_profile['uploaded_resume'] = resolved_upload
+    return build_docx_style_pdf_bundle(
+        resume=resume,
+        profile=export_profile,
+        output_dir=_resolve_output_dir(app_settings.get('download_output_dir', 'saved_resumes')),
+        pdf_cfg=_pdf_export_config(app_settings),
+    )
+
+
 def _render_application_answers_tab(resume_snapshot: dict, job_description: str, target_role: str, use_ai: bool, cache_prefix: str, default_questions: str | None = None) -> None:
     questions_key = f'{cache_prefix}_questions'
     cache_key = f'{cache_prefix}|{target_role}|{resume_snapshot.get("headline", "")}'
@@ -774,6 +925,43 @@ def _render_application_answers_tab(resume_snapshot: dict, job_description: str,
 
 # ---------- Save/finalize ----------
 
+def _render_readable_pdf_preview(pdf_bytes: bytes, fallback_html: str = '', message: str = '') -> None:
+    if not pdf_bytes:
+        st.error(message or 'PDF preview is unavailable because PDF export did not return a file.')
+        if fallback_html:
+            st.components.v1.html(fallback_html, height=420, scrolling=True)
+        return
+
+    if message:
+        st.caption(f'PDF exporter: {message}')
+
+    try:
+        import fitz  # PyMuPDF
+    except Exception as exc:
+        st.warning(f'PDF image preview is unavailable because PyMuPDF is not installed: {exc}')
+        if fallback_html:
+            st.components.v1.html(fallback_html, height=1180, scrolling=True)
+        return
+
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype='pdf')
+        if doc.page_count <= 0:
+            st.error('PDF preview is unavailable because the generated PDF has no pages.')
+            return
+        st.caption(f'Read-only PDF image preview ({doc.page_count} page{"s" if doc.page_count != 1 else ""}).')
+        zoom = 2.0
+        matrix = fitz.Matrix(zoom, zoom)
+        for page_index in range(doc.page_count):
+            page = doc.load_page(page_index)
+            pix = page.get_pixmap(matrix=matrix, alpha=False)
+            st.image(pix.tobytes('png'), caption=f'Page {page_index + 1}', use_container_width=True)
+        doc.close()
+    except Exception as exc:
+        st.warning(f'PDF image preview failed: {exc}')
+        if fallback_html:
+            st.components.v1.html(fallback_html, height=1180, scrolling=True)
+
+
 def _write_saved_resume_metadata(payload: dict) -> None:
     folder = Path(payload.get('saved_folder', ''))
     if not str(folder):
@@ -808,7 +996,7 @@ def _compact_resume_snapshot(resume: dict) -> dict:
             'company_name': str(item.get('company_name', '')).strip(),
             'duration': str(item.get('duration', '')).strip(),
             'location': str(item.get('location', '')).strip(),
-            'role': str(item.get('role', '')).strip(),
+            'role_title': str(item.get('role_title', item.get('role', ''))).strip(),
             'role_headline': str(item.get('role_headline', '')).strip(),
             'bullets': [str(bullet).strip() for bullet in item.get('bullets', []) if str(bullet).strip()],
         })
@@ -971,7 +1159,6 @@ def _post_download_dialog() -> None:
 def dashboard_page(user: dict) -> None:
     show_header(user)
     accessible_profiles = get_accessible_profiles(user)
-    templates = storage.get_templates()
     approved_jobs = storage.get_jobs(include_pending=False)
     app_settings = storage.get_app_settings()
     default_prompt = app_settings.get('default_prompt', '')
@@ -980,9 +1167,6 @@ def dashboard_page(user: dict) -> None:
 
     if not accessible_profiles:
         st.warning('No accessible profiles found. Ask an admin to assign a profile to your account.')
-        return
-    if not templates:
-        st.warning('No templates found yet. Add one in Template Settings first.')
         return
 
     applied_map = _build_applied_map_for_user(user, accessible_profiles)
@@ -1070,7 +1254,7 @@ def dashboard_page(user: dict) -> None:
 
         current_job_region = _normalize_region(selected_job.get('region', st.session_state.get('last_job_region', 'ANY')) if selected_job_id else st.session_state.get('last_job_region', 'ANY'))
 
-        region_col, profile_col, template_col, toggle_col = st.columns([0.95, 1.15, 1.0, 0.75])
+        region_col, profile_col, toggle_col = st.columns([0.95, 1.35, 0.75])
         with region_col:
             selected_region_label = st.selectbox(
                 'Job market',
@@ -1093,12 +1277,8 @@ def dashboard_page(user: dict) -> None:
 
         with profile_col:
             profile = st.selectbox('Profile', selectable_profiles, index=_find_index_by_id(selectable_profiles, st.session_state.get('last_profile_id')), format_func=_format_profile_option)
-
-        preferred_template_id = str(profile.get('default_template_id', '')).strip() or st.session_state.get('last_template_id')
-        template_index = _find_index_by_id(templates, preferred_template_id)
-
-        with template_col:
-            template = st.selectbox('Template', templates, index=template_index, format_func=lambda item: item.get('name', 'Unnamed template'))
+            if not _profile_has_uploaded_resume(profile):
+                st.warning('no resume so must upload resume')
         with toggle_col:
             use_ai = st.toggle('Use OpenAI', value=True, help='If OPENAI_API_KEY is missing, generation falls back automatically.')
 
@@ -1112,6 +1292,9 @@ def dashboard_page(user: dict) -> None:
             if not job_description.strip():
                 st.error('Please paste a job description first.')
                 return
+            if not _profile_has_uploaded_resume(profile):
+                st.error('no resume so must upload resume')
+                return
             with st.spinner('Generating resume content and export files...'):
                 result = generate_resume_content(
                     profile=profile,
@@ -1124,11 +1307,11 @@ def dashboard_page(user: dict) -> None:
                 )
                 resume = result['resume']
                 resume['bold_keywords'] = []
-                resume['auto_bold_fit_keywords'] = True
-                exports = build_export_bundle(resume=resume, profile=profile, template=template)
+                resume['auto_bold_fit_keywords'] = False
+                exports = _build_uploaded_docx_pdf_exports(resume=resume, profile=profile, app_settings=app_settings)
             st.session_state['last_resume'] = resume
             st.session_state['last_exports'] = exports
-            st.session_state['last_template_id'] = template.get('id')
+            st.session_state['last_template_id'] = 'uploaded_docx_style'
             st.session_state['last_profile_id'] = profile.get('id')
             st.session_state['last_job_link'] = st.session_state.get('last_job_link', '')
             st.session_state['last_job_description'] = job_description
@@ -1136,7 +1319,7 @@ def dashboard_page(user: dict) -> None:
             st.session_state['last_job_region'] = current_job_region
             st.session_state['last_custom_prompt'] = custom_prompt
             st.session_state['last_bold_keywords'] = ''
-            st.session_state['last_auto_bold_fit_keywords'] = True
+            st.session_state['last_auto_bold_fit_keywords'] = False
             st.session_state['last_update_prompt'] = ''
             st.session_state['last_generator_mode'] = result['mode']
             if selected_job.get('id'):
@@ -1158,7 +1341,7 @@ def dashboard_page(user: dict) -> None:
                 target_role=st.session_state.get('last_target_role', ''),
             )
         current_profile = storage.get_profile_by_id(st.session_state.get('last_profile_id')) or selectable_profiles[0]
-        current_template = storage.get_template_by_id(st.session_state.get('last_template_id')) or templates[template_index]
+        current_template = {'id': 'uploaded_docx_style', 'name': 'Uploaded DOCX style'}
         title_col, action_col = st.columns([4.3, 1.5])
         with title_col:
             if current_ats:
@@ -1166,8 +1349,8 @@ def dashboard_page(user: dict) -> None:
             else:
                 st.subheader('Generated Resume')
         with action_col:
-            can_save_pdf = bool(st.session_state.get('last_resume')) and bool(current_ats) and int(current_ats.get('overall_score', 0)) > 90
-            save_help = "Downloads the PDF to the user's browser. PDF download unlocks when ATS is over 90." if can_save_pdf else 'PDF download unlocks when ATS is over 90.'
+            can_save_pdf = bool(st.session_state.get('last_resume')) and bool(current_ats) and int(current_ats.get('overall_score', 0)) > 90 and bool((st.session_state.get('last_exports') or {}).get('pdf'))
+            save_help = "Downloads the styled PDF generated from the uploaded DOCX. PDF download unlocks when ATS is over 90." if can_save_pdf else 'PDF download unlocks when ATS is over 90.'
             download_clicked = st.download_button(
                 'Download PDF',
                 data=(st.session_state.get('last_exports') or {}).get('pdf', b''),
@@ -1197,12 +1380,21 @@ def dashboard_page(user: dict) -> None:
             exports = st.session_state['last_exports']
             tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(['Preview', 'Edit & Fix', 'Exports', 'ATS Notes', 'Job Application Answers', 'Structured Data', 'Source Profile'])
             with tab1:
-                st.caption('Preview is content-only. Any manual or AI-applied changes will update the preview and all downloads.')
-                st.components.v1.html(exports['html'], height=1180, scrolling=True)
+                st.caption('Read-only PDF preview. The PDF is generated from the uploaded DOCX style; only title, summary, skills, and experience content are changed.')
+                _render_readable_pdf_preview(
+                    pdf_bytes=(exports or {}).get('pdf', b''),
+                    fallback_html=(exports or {}).get('html', ''),
+                    message=(exports or {}).get('pdf_message', ''),
+                )
             with tab2:
                 _edit_and_fix_tab(current_profile, current_template, st.session_state.get('last_job_description', ''), st.session_state.get('last_target_role', ''), st.session_state.get('last_custom_prompt', ''), default_prompt, use_ai, clean_generation)
             with tab3:
                 st.markdown('**Download behavior**')
+                pdf_message = (st.session_state.get('last_exports') or {}).get('pdf_message', '')
+                if pdf_message:
+                    st.caption(f'PDF exporter: {pdf_message}')
+                if not (st.session_state.get('last_exports') or {}).get('pdf'):
+                    st.error('PDF export failed. Check App Settings > PDF backend order / WPS custom PDF command.')
                 st.info("In the deployed app, Download PDF sends the file to the user's browser and local Downloads flow.")
                 if current_ats and int(current_ats.get('overall_score', 0)) > 90:
                     st.success('Use the Download PDF button next to the Generated Resume title to download this ATS-qualified resume.')
@@ -1265,8 +1457,8 @@ def _edit_and_fix_tab(profile: dict, template: dict, job_description: str, targe
         if st.button('Apply manual edits', use_container_width=True):
             updated_resume = _resume_from_editor(st.session_state.get('last_resume') or {})
             updated_resume['bold_keywords'] = (st.session_state.get('last_resume') or {}).get('bold_keywords', [])
-            updated_resume['auto_bold_fit_keywords'] = bool((st.session_state.get('last_resume') or {}).get('auto_bold_fit_keywords', True))
-            exports = build_export_bundle(resume=updated_resume, profile=profile, template=template)
+            updated_resume['auto_bold_fit_keywords'] = bool((st.session_state.get('last_resume') or {}).get('auto_bold_fit_keywords', False))
+            exports = _build_uploaded_docx_pdf_exports(resume=updated_resume, profile=profile, app_settings=storage.get_app_settings())
             st.session_state['last_resume'] = updated_resume
             st.session_state['last_exports'] = exports
             st.session_state['last_generator_mode'] = 'manual-edit'
@@ -1286,13 +1478,13 @@ def _edit_and_fix_tab(profile: dict, template: dict, job_description: str, targe
             return
         current_draft = _resume_from_editor(st.session_state.get('last_resume') or {})
         current_draft['bold_keywords'] = (st.session_state.get('last_resume') or {}).get('bold_keywords', [])
-        current_draft['auto_bold_fit_keywords'] = bool((st.session_state.get('last_resume') or {}).get('auto_bold_fit_keywords', True))
+        current_draft['auto_bold_fit_keywords'] = bool((st.session_state.get('last_resume') or {}).get('auto_bold_fit_keywords', False))
         with st.spinner('Updating current draft with OpenAI...'):
             result = update_resume_content(profile=profile, job_description=job_description, current_resume=current_draft, fix_prompt=fix_prompt, target_role=target_role, custom_prompt=custom_prompt, default_prompt=default_prompt, use_ai=use_ai, clean_generation=clean_generation)
             updated_resume = result['resume']
             updated_resume['bold_keywords'] = current_draft.get('bold_keywords', [])
-            updated_resume['auto_bold_fit_keywords'] = bool(current_draft.get('auto_bold_fit_keywords', True))
-            exports = build_export_bundle(resume=updated_resume, profile=profile, template=template)
+            updated_resume['auto_bold_fit_keywords'] = bool(current_draft.get('auto_bold_fit_keywords', False))
+            exports = _build_uploaded_docx_pdf_exports(resume=updated_resume, profile=profile, app_settings=storage.get_app_settings())
         st.session_state['last_resume'] = updated_resume
         st.session_state['last_exports'] = exports
         st.session_state['last_update_prompt'] = fix_prompt
@@ -1303,6 +1495,19 @@ def _edit_and_fix_tab(profile: dict, template: dict, job_description: str, targe
 
 # ---------- Admin pages ----------
 
+def _profile_name_conflict(name: str, current_profile_id: str = '') -> dict | None:
+    clean_name = re.sub(r'\s+', ' ', str(name or '')).strip().casefold()
+    current_profile_id = str(current_profile_id or '').strip()
+    if not clean_name:
+        return None
+    for profile in storage.get_profiles():
+        existing_id = str(profile.get('id', '') or '').strip()
+        existing_name = re.sub(r'\s+', ' ', str(profile.get('name', '') or '')).strip().casefold()
+        if existing_name == clean_name and existing_id != current_profile_id:
+            return profile
+    return None
+
+
 def profile_settings_page(user: dict) -> None:
     if not is_admin(user):
         st.error('Only admins can manage profiles.')
@@ -1310,14 +1515,21 @@ def profile_settings_page(user: dict) -> None:
     show_header(user)
     st.subheader('Profile Settings')
     profiles = storage.get_profiles()
-    templates = storage.get_templates()
-    profile_names = [p.get('name', 'Unnamed') for p in profiles]
+    profile_labels = [f"{p.get('name', 'Unnamed')} - {_profile_resume_status(p)}" for p in profiles]
     mode = st.radio('Profile action', ['Edit existing', 'Create new'], horizontal=True)
     if mode == 'Edit existing' and profiles:
-        selected_name = st.selectbox('Choose profile', profile_names)
-        selected_profile = next(p for p in profiles if p.get('name') == selected_name)
+        selected_label = st.selectbox('Choose profile', profile_labels)
+        selected_index = profile_labels.index(selected_label)
+        selected_profile = profiles[selected_index]
     else:
-        selected_profile = {'id': '', 'name': '', 'email': '', 'phone': '', 'location': '', 'region': 'ANY', 'linkedin': '', 'portfolio': '', 'default_template_id': '', 'summary_seed': '', 'technical_skills': [], 'work_history': [], 'education_history': []}
+        selected_profile = {'id': '', 'name': '', 'email': '', 'phone': '', 'location': '', 'region': 'ANY', 'linkedin': '', 'portfolio': '', 'summary_seed': '', 'technical_skills': [], 'work_history': [], 'education_history': [], 'uploaded_resume': {}}
+
+    upload_info = _resolved_uploaded_resume_record(selected_profile)
+    if _profile_has_uploaded_resume(selected_profile):
+        st.success(f"resume uploaded: {upload_info.get('filename', 'resume.docx')}")
+    else:
+        st.warning('no resume so must upload resume')
+
     with st.form('profile_form'):
         c1, c2 = st.columns(2)
         with c1:
@@ -1329,31 +1541,38 @@ def profile_settings_page(user: dict) -> None:
             region = st.selectbox('Profile market', REGION_OPTIONS, index=REGION_OPTIONS.index(_region_label(selected_profile.get('region', 'ANY'))) if _region_label(selected_profile.get('region', 'ANY')) in REGION_OPTIONS else 0)
             linkedin = st.text_input('LinkedIn', value=selected_profile.get('linkedin', ''))
             portfolio = st.text_input('Portfolio / GitHub', value=selected_profile.get('portfolio', ''))
-            template_options = [''] + [item.get('id', '') for item in templates]
-            selected_default_template_id = str(selected_profile.get('default_template_id', '') or '').strip()
-            if selected_default_template_id not in template_options:
-                selected_default_template_id = ''
-            default_template_id = st.selectbox(
-                'Default resume template',
-                template_options,
-                index=template_options.index(selected_default_template_id),
-                format_func=lambda template_id: 'No default template' if not template_id else next((item.get('name', 'Unnamed template') for item in templates if item.get('id') == template_id), 'Unknown template'),
-            )
-        skills_text = st.text_area('Technical skills (comma separated)', value=', '.join(selected_profile.get('technical_skills', [])), height=120)
-        summary_seed = st.text_area('About / summary seed', value=selected_profile.get('summary_seed', ''), height=140)
-        st.markdown('### Work history')
-        st.caption('One company block per section using: Company | Duration | Location, then bullets below. Do not add a role here; AI will tailor the role title from the job description.')
-        work_history_text = st.text_area('Work history', value=_serialize_work_history(selected_profile.get('work_history', [])), height=280)
-        st.markdown('### Education history')
-        st.caption('One education block per section using: University | Degree | Duration | Location')
-        education_text = st.text_area('Education history', value=_serialize_education_history(selected_profile.get('education_history', [])), height=180)
+        uploaded_resume = st.file_uploader('Upload resume DOCX', type=['docx'], help='Required. The generated PDF keeps this DOCX style and only replaces allowed resume content sections.')
+        st.caption('Only DOCX uploads are accepted. New profiles cannot be saved without a resume DOCX.')
+        skills_text = st.text_area('Technical skills (comma separated, optional helper for AI)', value=', '.join(selected_profile.get('technical_skills', [])), height=90)
+        summary_seed = st.text_area('About / summary seed (optional helper for AI)', value=selected_profile.get('summary_seed', ''), height=100)
+        st.markdown('### Work history helper data (optional)')
+        st.caption('The uploaded DOCX is the source style. These fields are optional AI helper data if you want stronger structured generation.')
+        work_history_text = st.text_area('Work history', value=_serialize_work_history(selected_profile.get('work_history', [])), height=220)
+        st.markdown('### Education history helper data (optional)')
+        education_text = st.text_area('Education history', value=_serialize_education_history(selected_profile.get('education_history', [])), height=120)
         submitted = st.form_submit_button('Save profile', type='primary')
     if submitted:
         if not name.strip():
             st.error('Profile name is required.')
             return
+        existing_profile = _profile_name_conflict(name, selected_profile.get('id', ''))
+        if existing_profile:
+            st.error(f"Profile name already exists: {existing_profile.get('name', '').strip() or 'Unnamed profile'}. Use a different profile name.")
+            return
+        profile_id = selected_profile.get('id') or storage.make_id('profile')
+        uploaded_resume_record = copy.deepcopy(upload_info) if upload_info else {}
+        if uploaded_resume is not None:
+            try:
+                uploaded_resume_record = _save_uploaded_resume_docx(profile_id, uploaded_resume)
+            except Exception as exc:
+                st.error(str(exc))
+                return
+        resolved_existing_path = Path(str(uploaded_resume_record.get('path', ''))) if uploaded_resume_record.get('path') else None
+        if not uploaded_resume_record or not resolved_existing_path or not resolved_existing_path.exists():
+            st.error('no resume so must upload resume')
+            return
         payload = {
-            'id': selected_profile.get('id') or storage.make_id('profile'),
+            'id': profile_id,
             'name': name.strip(),
             'email': email.strip(),
             'phone': phone.strip(),
@@ -1361,11 +1580,12 @@ def profile_settings_page(user: dict) -> None:
             'region': _normalize_region(region),
             'linkedin': linkedin.strip(),
             'portfolio': portfolio.strip(),
-            'default_template_id': str(default_template_id or '').strip(),
+            'default_template_id': '',
             'summary_seed': summary_seed.strip(),
             'technical_skills': [item.strip() for item in skills_text.split(',') if item.strip()],
             'work_history': _parse_work_history(work_history_text),
             'education_history': _parse_education_history(education_text),
+            'uploaded_resume': uploaded_resume_record,
         }
         storage.upsert_profile(payload)
         st.success('Profile saved.')
@@ -1376,67 +1596,6 @@ def profile_settings_page(user: dict) -> None:
             st.success('Profile deleted.')
             st.rerun()
 
-
-def template_settings_page(user: dict) -> None:
-    if not is_admin(user):
-        st.error('Only admins can manage templates.')
-        return
-    show_header(user)
-    st.subheader('Template Settings')
-    st.caption('Each resume template is stored separately. Template names must be unique.')
-    templates = storage.get_templates()
-    template_names = [t.get('name', 'Unnamed') for t in templates]
-    mode = st.radio('Template action', ['Edit existing', 'Create new'], horizontal=True)
-    if mode == 'Edit existing' and templates:
-        selected_name = st.selectbox('Choose template', template_names)
-        selected_template = next(t for t in templates if t.get('name') == selected_name)
-    else:
-        selected_template = {'id': '', 'name': '', 'font_family': 'Arial, sans-serif', 'accent_color': '#1f4e79', 'text_color': '#111827', 'muted_color': '#4b5563', 'background_color': '#ffffff', 'section_order': ['summary', 'technical_skills', 'work_history', 'education_history'], 'custom_css': '', 'layout_style': 'ats_classic', 'header_style': 'rule', 'skill_style': 'grouped_bullets', 'density': 'normal', 'show_role_headline': True}
-    with st.form('template_form'):
-        c1, c2 = st.columns(2)
-        with c1:
-            name = st.text_input('Template name', value=selected_template.get('name', ''))
-            font_family = st.selectbox('Font family', ['Arial, sans-serif', 'Calibri, sans-serif', 'Georgia, serif'], index=['Arial, sans-serif', 'Calibri, sans-serif', 'Georgia, serif'].index(selected_template.get('font_family', 'Arial, sans-serif') if selected_template.get('font_family', 'Arial, sans-serif') in ['Arial, sans-serif', 'Calibri, sans-serif', 'Georgia, serif'] else 'Arial, sans-serif'))
-            accent_color = st.color_picker('Accent color', value=selected_template.get('accent_color', '#1f4e79'))
-            text_color = st.color_picker('Text color', value=selected_template.get('text_color', '#111827'))
-        with c2:
-            muted_color = st.color_picker('Muted color', value=selected_template.get('muted_color', '#4b5563'))
-            background_color = st.color_picker('Background color', value=selected_template.get('background_color', '#ffffff'))
-            header_style = st.selectbox('Header style', ['rule', 'minimal'], index=['rule', 'minimal'].index(selected_template.get('header_style', 'rule')))
-            density = st.selectbox('Density', ['normal', 'tight'], index=['normal', 'tight'].index(selected_template.get('density', 'normal')))
-        c3, c4 = st.columns(2)
-        with c3:
-            skill_style = st.selectbox('Skill style', ['grouped_bullets', 'comma', 'pipe', 'chips'], index=['grouped_bullets', 'comma', 'pipe', 'chips'].index(selected_template.get('skill_style', 'grouped_bullets') if selected_template.get('skill_style', 'grouped_bullets') in ['grouped_bullets', 'comma', 'pipe', 'chips'] else 'grouped_bullets'))
-            show_role_headline = st.checkbox('Show company role headline', value=bool(selected_template.get('show_role_headline', True)))
-        with c4:
-            section_order_text = st.text_input('Section order (comma separated)', value=', '.join(selected_template.get('section_order', [])))
-            layout_style = st.selectbox('Template family', ['ats_classic', 'ats_compact', 'ats_technical'], index=['ats_classic', 'ats_compact', 'ats_technical'].index(selected_template.get('layout_style', 'ats_classic')))
-        custom_css = st.text_area('Custom CSS (optional)', value=selected_template.get('custom_css', ''), height=160)
-        submitted = st.form_submit_button('Save template', type='primary')
-    if submitted:
-        if not name.strip():
-            st.error('Template name is required.')
-            return
-        duplicate_template = next((item for item in templates if item.get('name', '').strip().lower() == name.strip().lower() and item.get('id') != selected_template.get('id')), None)
-        if duplicate_template:
-            st.error('Template name must be unique. Choose a different template name.')
-            return
-        payload = {'id': selected_template.get('id') or storage.make_id('template'), 'name': name.strip(), 'font_family': font_family, 'accent_color': accent_color, 'text_color': text_color, 'muted_color': muted_color, 'background_color': background_color, 'section_order': [item.strip() for item in section_order_text.split(',') if item.strip()], 'custom_css': custom_css, 'layout_style': layout_style, 'header_style': header_style, 'skill_style': skill_style, 'density': density, 'show_role_headline': show_role_headline}
-        storage.upsert_template(payload)
-        st.success('Template saved.')
-        st.rerun()
-    if mode == 'Edit existing' and templates:
-        if st.button('Delete selected template'):
-            storage.delete_template(selected_template.get('id'))
-            st.success('Template deleted.')
-            st.rerun()
-    st.markdown('### Template preview')
-    preview_profile = {'name': 'Preview Candidate', 'email': 'candidate@example.com', 'phone': '+1 555 123 4567', 'location': 'Remote', 'region': 'US', 'linkedin': 'linkedin.com/in/preview', 'portfolio': 'github.com/preview'}
-    preview_resume = {'headline': 'Platform Engineer | Python | Kubernetes | AWS', 'summary': 'Platform-focused engineer building reliable internal tooling, APIs, and cloud infrastructure with ATS-friendly formatting and clear technical positioning.', 'technical_skills': ['Python', 'React', 'TypeScript', 'FastAPI', 'PostgreSQL', 'Docker', 'Kubernetes', 'AWS', 'Terraform', 'Pytest'], 'skill_groups': [{'category': 'Languages', 'items': ['Python', 'TypeScript']}, {'category': 'Frontend', 'items': ['React']}, {'category': 'Backend', 'items': ['FastAPI']}, {'category': 'Data', 'items': ['PostgreSQL']}, {'category': 'Cloud / DevOps', 'items': ['Docker', 'Kubernetes', 'AWS', 'Terraform']}, {'category': 'Testing', 'items': ['Pytest']}], 'fit_keywords': ['Python', 'Kubernetes', 'AWS', 'Terraform'], 'work_history': [{'company_name': 'Example Corp', 'role_title': 'Platform Engineer', 'role_headline': 'Built internal tooling and platform services aligned to cloud and delivery workflows.', 'duration': '2024 - Present', 'location': 'Remote', 'bullets': ['Built Python automation and infrastructure tooling across AWS and Kubernetes.', 'Improved delivery reliability through CI/CD hardening and monitoring upgrades.']}], 'education_history': [{'university': 'Example University', 'degree': 'B.S. Computer Science', 'duration': '2014 - 2018', 'location': 'California'}], 'bold_keywords': ['Python', 'AWS'], 'auto_bold_fit_keywords': True}
-    preview_html = render_resume_html(preview_resume, preview_profile, {'id': 'preview'} | selected_template)
-    st.components.v1.html(preview_html, height=850, scrolling=True)
-
-
 def app_settings_page(user: dict) -> None:
     if not is_admin(user):
         st.error('Only admins can manage app settings.')
@@ -1446,12 +1605,17 @@ def app_settings_page(user: dict) -> None:
     settings = storage.get_app_settings()
     with st.form('app_settings_form'):
         default_prompt = st.text_area('Default prompt', value=settings.get('default_prompt', ''), height=220, placeholder='Default resume guidance that should apply to every generation...')
-        download_output_dir = st.text_input('Server save folder (local desktop mode only)', value=settings.get('download_output_dir', 'saved_resumes'), help='Deployed browser downloads go to the user browser download flow. This setting only matters for local/server-side save workflows.')
+        download_output_dir = st.text_input('Server save folder (local desktop mode only)', value=settings.get('download_output_dir', 'saved_resumes'), help='Temporary DOCX/PDF files are created server-side before browser download.')
+        pdf_backend_order = st.text_input('PDF backend order', value=settings.get('pdf_backend_order', ', '.join(default_backend_order())), help='Comma-separated. For Windows + WPS, configure wps_custom when docx2pdf/Word is unavailable.')
+        wps_pdf_command = st.text_input('WPS custom PDF command', value=settings.get('wps_pdf_command', ''), help='Optional. Example: "C:\\Path\\to\\wps_export.bat" "{input}" "{output}"')
         submitted = st.form_submit_button('Save app settings', type='primary')
     if submitted:
-        storage.save_app_settings({'default_prompt': default_prompt.strip(), 'always_clean_generation': True, 'download_output_dir': download_output_dir.strip() or 'saved_resumes'})
+        storage.save_app_settings({'default_prompt': default_prompt.strip(), 'always_clean_generation': True, 'download_output_dir': download_output_dir.strip() or 'saved_resumes', 'pdf_backend_order': pdf_backend_order.strip() or ', '.join(default_backend_order()), 'wps_pdf_command': wps_pdf_command.strip()})
         st.success('App settings saved.')
         st.rerun()
+    with st.expander('Detected PDF export backends'):
+        for line in pdf_backend_status(_pdf_export_config(settings)):
+            st.write(f'- {line}')
 
 
 def _profile_assignment_owner_map(users: list[dict], exclude_user_id: str = "") -> dict[str, str]:
@@ -2123,32 +2287,25 @@ def _render_generated_resume_download_tab(item: dict, resume_snapshot: dict, ite
         'location': '',
         'linkedin': '',
         'github': '',
+        'uploaded_resume': {},
     }
-    template = storage.get_template_by_id(item.get('template_id', '')) or {
-        'id': 'fallback_template',
-        'name': 'ATS Classic',
-        'accent_color': '#1f4e79',
-        'text_color': '#111827',
-        'muted_color': '#4b5563',
-        'font_family': 'Arial, sans-serif',
-        'header_style': 'rule',
-        'density': 'normal',
-        'skill_style': 'grouped_bullets',
-        'section_order': ['summary', 'technical_skills', 'work_history', 'education_history'],
-    }
-    exports = build_export_bundle(resume=resume_snapshot, profile=profile, template=template)
     filename = item.get('download_filename') or item.get('saved_files', {}).get('pdf') or f"{_build_file_stem(profile)}.pdf"
     st.write(f"Download filename: {filename}")
+    try:
+        exports = _build_uploaded_docx_pdf_exports(resume=resume_snapshot, profile=profile, app_settings=storage.get_app_settings())
+    except Exception as exc:
+        st.error(str(exc))
+        return
     st.download_button(
-        'Download Resume',
+        'Download Resume PDF',
         data=exports.get('pdf', b''),
         file_name=filename,
         mime='application/pdf',
         use_container_width=True,
+        disabled=not bool(exports.get('pdf')),
         key=f'generated_resume_download_{item_key}',
     )
-    st.caption('The PDF is regenerated from the saved resume snapshot so you can download it again any time.')
-
+    st.caption('The PDF is regenerated from the saved resume snapshot and the uploaded profile DOCX style.')
 
 def _render_interview_schedule_tab(item: dict, item_key: str, user: dict) -> None:
     schedule = item.get('interview_schedule', {}) if isinstance(item.get('interview_schedule', {}), dict) else {}
@@ -2320,7 +2477,7 @@ def generated_resumes_page(user: dict) -> None:
             with tab1:
                 st.write(f"Created: {created_at or 'n/a'}")
                 st.write(f"Resume ID: {item.get('saved_resume_id', 'n/a')}")
-                st.write(f"Template ID: {item.get('template_id')}")
+                st.write("Style source: Uploaded DOCX")
                 st.write(f"Company message status: {item.get('company_message_status', 'n/a')}")
                 if item.get('job_link'):
                     st.write(f"Job link: {item.get('job_link')}")
@@ -2432,7 +2589,7 @@ def _dashboard_ats_notes_tab(profile: dict, template: dict, resume: dict, job_de
         with st.spinner('Improving the current draft against ATS guidance...'):
             result = improve_resume_to_target_ats(profile=profile, job_description=job_description, current_resume=current_resume, target_score=int(target_score), max_rounds=int(max_rounds), additional_requirements=st.session_state.get('dashboard_ats_improve_prompt', ''), target_role=target_role, custom_prompt=custom_prompt, default_prompt=default_prompt, use_ai=use_ai, clean_generation=clean_generation)
         updated_resume = result.get('resume', current_resume)
-        exports = build_export_bundle(resume=updated_resume, profile=profile, template=template)
+        exports = _build_uploaded_docx_pdf_exports(resume=updated_resume, profile=profile, app_settings=storage.get_app_settings())
         st.session_state['last_resume'] = updated_resume
         st.session_state['last_exports'] = exports
         st.session_state['last_generator_mode'] = result.get('mode', 'ats-improve')
@@ -2548,7 +2705,7 @@ def _resume_from_editor(base_resume: dict) -> dict:
     for idx in range(int(st.session_state.get('editor_work_count', 0))):
         bullets = [line.strip() for line in st.session_state.get(f'editor_job_bullets_{idx}', '').splitlines() if line.strip()]
         work_history.append({'company_name': st.session_state.get(f'editor_job_company_{idx}', '').strip(), 'duration': st.session_state.get(f'editor_job_duration_{idx}', '').strip(), 'location': st.session_state.get(f'editor_job_location_{idx}', '').strip(), 'role_title': st.session_state.get(f'editor_job_role_{idx}', '').strip(), 'role_headline': st.session_state.get(f'editor_job_headline_{idx}', '').strip(), 'bullets': bullets})
-    return {'headline': st.session_state.get('editor_headline', '').strip(), 'summary': st.session_state.get('editor_summary', '').strip(), 'technical_skills': technical_skills, 'skill_groups': skill_groups, 'fit_keywords': _parse_comma_separated_list(st.session_state.get('editor_fit_keywords', '')), 'work_history': work_history, 'education_history': _parse_education_history(st.session_state.get('editor_education', '')), 'bold_keywords': base_resume.get('bold_keywords', []), 'auto_bold_fit_keywords': bool(base_resume.get('auto_bold_fit_keywords', True))}
+    return {'headline': st.session_state.get('editor_headline', '').strip(), 'summary': st.session_state.get('editor_summary', '').strip(), 'technical_skills': technical_skills, 'skill_groups': skill_groups, 'fit_keywords': _parse_comma_separated_list(st.session_state.get('editor_fit_keywords', '')), 'work_history': work_history, 'education_history': _parse_education_history(st.session_state.get('editor_education', '')), 'bold_keywords': base_resume.get('bold_keywords', []), 'auto_bold_fit_keywords': bool(base_resume.get('auto_bold_fit_keywords', False))}
 
 
 # ---------- Navigation ----------
@@ -2556,7 +2713,7 @@ def _resume_from_editor(base_resume: dict) -> dict:
 def render_top_nav(user: dict) -> str:
     options = ['Dashboard', 'Job List', 'Generated Resumes']
     if is_admin(user):
-        options += ['User Access', 'Profile Settings', 'Template Settings', 'App Settings']
+        options += ['User Access', 'Profile Settings', 'App Settings']
     else:
         options += ['My Weekly Result']
 
@@ -2647,7 +2804,5 @@ elif page == 'User Access':
     user_access_page(current_user)
 elif page == 'Profile Settings':
     profile_settings_page(current_user)
-elif page == 'Template Settings':
-    template_settings_page(current_user)
 else:
     app_settings_page(current_user)

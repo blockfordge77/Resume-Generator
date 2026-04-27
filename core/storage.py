@@ -539,6 +539,7 @@ class Storage:
                 'portfolio': item.get('portfolio', ''),
                 'default_template_id': str(item.get('default_template_id', '')).strip(),
                 'summary_seed': item.get('summary_seed', ''),
+                'uploaded_resume': self._normalize_uploaded_resume(item.get('uploaded_resume', {}) if isinstance(item.get('uploaded_resume', {}), dict) else {}),
                 'technical_skills': [str(s).strip() for s in item.get('technical_skills', []) if str(s).strip()],
                 'region': _normalize_market_region(item.get('region', item.get('market_region', ''))),
                 'work_history': work_history,
@@ -553,6 +554,23 @@ class Storage:
                 ],
             })
         return normalized
+
+    def _normalize_uploaded_resume(self, item: Any) -> dict:
+        source = item if isinstance(item, dict) else {}
+        path = str(source.get('path', source.get('storage_path', ''))).strip()
+        relative_path = str(source.get('relative_path', '')).strip()
+        if not path and not relative_path:
+            return {}
+        return {
+            'filename': str(source.get('filename', '')).strip(),
+            'content_type': str(source.get('content_type', '')).strip(),
+            'size_bytes': int(source.get('size_bytes', 0) or 0),
+            'path': path,
+            'relative_path': relative_path,
+            'uploaded_at': str(source.get('uploaded_at', '')).strip(),
+            'extracted_text': str(source.get('extracted_text', '') or ''),
+        }
+
 
     def _normalize_templates(self, items: Any) -> list[dict]:
         defaults = _template_defaults()
