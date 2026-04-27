@@ -18,7 +18,7 @@ from urllib import request as urlrequest
 import streamlit as st
 from dotenv import load_dotenv
 
-from core.docx_resume_export import build_docx_style_pdf_bundle, pdf_backend_status
+from core.docx_resume_export import build_docx_style_pdf_bundle, default_backend_order, pdf_backend_status
 from core.resume_engine import (
     analyze_ats_score,
     generate_application_answers,
@@ -867,7 +867,7 @@ def _pdf_export_config(settings: dict) -> dict:
     order_raw = str(settings.get('pdf_backend_order', '') or '').strip()
     backend_order = [item.strip() for item in order_raw.split(',') if item.strip()]
     if not backend_order:
-        backend_order = ['docx2pdf', 'word', 'libreoffice', 'wps_custom']
+        backend_order = default_backend_order()
     return {
         'backend_order': backend_order,
         'wps_pdf_command': str(settings.get('wps_pdf_command', '') or '').strip(),
@@ -1606,11 +1606,11 @@ def app_settings_page(user: dict) -> None:
     with st.form('app_settings_form'):
         default_prompt = st.text_area('Default prompt', value=settings.get('default_prompt', ''), height=220, placeholder='Default resume guidance that should apply to every generation...')
         download_output_dir = st.text_input('Server save folder (local desktop mode only)', value=settings.get('download_output_dir', 'saved_resumes'), help='Temporary DOCX/PDF files are created server-side before browser download.')
-        pdf_backend_order = st.text_input('PDF backend order', value=settings.get('pdf_backend_order', 'docx2pdf, word, libreoffice, wps_custom'), help='Comma-separated. For Windows + WPS, configure wps_custom when docx2pdf/Word is unavailable.')
+        pdf_backend_order = st.text_input('PDF backend order', value=settings.get('pdf_backend_order', ', '.join(default_backend_order())), help='Comma-separated. For Windows + WPS, configure wps_custom when docx2pdf/Word is unavailable.')
         wps_pdf_command = st.text_input('WPS custom PDF command', value=settings.get('wps_pdf_command', ''), help='Optional. Example: "C:\\Path\\to\\wps_export.bat" "{input}" "{output}"')
         submitted = st.form_submit_button('Save app settings', type='primary')
     if submitted:
-        storage.save_app_settings({'default_prompt': default_prompt.strip(), 'always_clean_generation': True, 'download_output_dir': download_output_dir.strip() or 'saved_resumes', 'pdf_backend_order': pdf_backend_order.strip() or 'docx2pdf, word, libreoffice, wps_custom', 'wps_pdf_command': wps_pdf_command.strip()})
+        storage.save_app_settings({'default_prompt': default_prompt.strip(), 'always_clean_generation': True, 'download_output_dir': download_output_dir.strip() or 'saved_resumes', 'pdf_backend_order': pdf_backend_order.strip() or ', '.join(default_backend_order()), 'wps_pdf_command': wps_pdf_command.strip()})
         st.success('App settings saved.')
         st.rerun()
     with st.expander('Detected PDF export backends'):

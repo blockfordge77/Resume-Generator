@@ -1251,13 +1251,19 @@ def export_pdf_via_wps_custom(docx_path: Path, pdf_path: Path, pdf_cfg: dict) ->
         return False, f"WPS export failed: {exc!r}"
 
 
+def default_backend_order() -> list[str]:
+    if sys.platform == "win32":
+        return ["docx2pdf", "word", "libreoffice", "wps_custom"]
+    return ["libreoffice", "wps_custom", "docx2pdf", "word"]
+
+
 def export_pdf(docx_path: Path, pdf_path: Path, pdf_cfg: dict | None = None) -> tuple[bool, str]:
     pdf_cfg = pdf_cfg or {}
     order = pdf_cfg.get("backend_order")
     if isinstance(order, str):
         order = [item.strip() for item in order.split(",") if item.strip()]
     if not isinstance(order, list) or not order:
-        order = ["docx2pdf", "word", "libreoffice", "wps_custom"]
+        order = default_backend_order()
     backend_map = {
         "docx2pdf": lambda: export_pdf_via_docx2pdf(docx_path, pdf_path),
         "word": lambda: export_pdf_via_word(docx_path, pdf_path),
