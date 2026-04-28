@@ -18,7 +18,7 @@ from urllib import request as urlrequest
 import streamlit as st
 from dotenv import load_dotenv
 
-from core.docx_resume_export import build_docx_style_pdf_bundle, default_backend_order, pdf_backend_status
+from core.docx_resume_export import build_docx_style_pdf_bundle, build_docx_template_pdf_bundle, pdf_backend_status
 from core.resume_engine import (
     analyze_ats_score,
     generate_application_answers,
@@ -867,7 +867,7 @@ def _pdf_export_config(settings: dict) -> dict:
     order_raw = str(settings.get('pdf_backend_order', '') or '').strip()
     backend_order = [item.strip() for item in order_raw.split(',') if item.strip()]
     if not backend_order:
-        backend_order = default_backend_order()
+        backend_order = ['docx2pdf', 'word', 'libreoffice', 'wps_custom']
     return {
         'backend_order': backend_order,
         'wps_pdf_command': str(settings.get('wps_pdf_command', '') or '').strip(),
@@ -886,6 +886,36 @@ def _build_uploaded_docx_pdf_exports(resume: dict, profile: dict, app_settings: 
         output_dir=_resolve_output_dir(app_settings.get('download_output_dir', 'saved_resumes')),
         pdf_cfg=_pdf_export_config(app_settings),
     )
+
+
+def _build_uploaded_docx_template_pdf_exports(profile: dict, app_settings: dict) -> dict:
+    """Create a read-only PDF preview of the selected profile's uploaded DOCX.
+
+    This preview runs before resume generation. It must not apply generated
+    content, replace placeholders, or modify the uploaded template file.
+    """
+    resolved_upload = _resolved_uploaded_resume_record(profile)
+    path_value = str((resolved_upload or {}).get('path', '') or '').strip()
+    if not resolved_upload or not path_value or not Path(path_value).exists():
+        raise FileNotFoundError('no resume so must upload resume')
+    export_profile = copy.deepcopy(profile)
+    export_profile['uploaded_resume'] = resolved_upload
+    return build_docx_template_pdf_bundle(
+        profile=export_profile,
+        output_dir=_resolve_output_dir(app_settings.get('download_output_dir', 'saved_resumes')),
+        pdf_cfg=_pdf_export_config(app_settings),
+    )
+
+
+def _uploaded_resume_signature(profile: dict) -> str:
+    path = _resolve_uploaded_resume_path(profile)
+    if not path:
+        return f"{profile.get('id', '')}|missing"
+    try:
+        stat = path.stat()
+        return f"{profile.get('id', '')}|{path}|{stat.st_size}|{stat.st_mtime_ns}"
+    except OSError:
+        return f"{profile.get('id', '')}|{path}|unknown"
 
 
 def _render_application_answers_tab(resume_snapshot: dict, job_description: str, target_role: str, use_ai: bool, cache_prefix: str, default_questions: str | None = None) -> None:
@@ -960,6 +990,88 @@ def _render_readable_pdf_preview(pdf_bytes: bytes, fallback_html: str = '', mess
         st.warning(f'PDF image preview failed: {exc}')
         if fallback_html:
             st.components.v1.html(fallback_html, height=1180, scrolling=True)
+
+
+def _render_uploaded_resume_template_preview(profile: dict, app_settings: dict, key_prefix: str) -> None:
+    """Render a read-only preview for the selected profile's uploaded DOCX."""
+    resolved_upload = _resolved_uploaded_resume_record(profile)
+    docx_path = _resolve_uploaded_resume_path(profile)
+
+    if not docx_path:
+        st.warning('no resume so must upload resume')
+        return
+
+    signature = _uploaded_resume_signature(profile)
+    sig_key = f'{key_prefix}_template_preview_signature'
+    preview_key = f'{key_prefix}_template_preview_exports'
+    error_key = f'{key_prefix}_template_preview_error'
+
+    if st.session_state.get(sig_key) != signature:
+        st.session_state[sig_key] = signature
+        st.session_state.pop(preview_key, None)
+        st.session_state.pop(error_key, None)
+
+    filename = str(resolved_upload.get('filename', '') or docx_path.name)
+    size_bytes = int(resolved_upload.get('size_bytes', 0) or 0)
+    size_label = f"{size_bytes / 1024:.1f} KB" if size_bytes else "unknown size"
+
+    info_col, action_col = st.columns([2.2, 1.0], gap='small')
+    with info_col:
+        st.caption(f"Uploaded DOCX: {filename} • {size_label}")
+        st.caption('Preview is read-only and uses the selected profile resume template before generation.')
+    with action_col:
+        try:
+            st.download_button(
+                'Download uploaded DOCX',
+                data=docx_path.read_bytes(),
+                file_name=filename,
+                mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                use_container_width=True,
+                key=f'{key_prefix}_download_uploaded_docx',
+            )
+        except Exception as exc:
+            st.warning(f'Could not prepare DOCX download: {exc}')
+
+    if st.button('Read uploaded resume template', key=f'{key_prefix}_read_template_button', use_container_width=True):
+        try:
+            with st.spinner('Creating read-only template preview...'):
+                st.session_state[preview_key] = _build_uploaded_docx_template_pdf_exports(profile, app_settings)
+                st.session_state.pop(error_key, None)
+        except Exception as exc:
+            st.session_state[preview_key] = {}
+            st.session_state[error_key] = str(exc)
+
+    preview_exports = st.session_state.get(preview_key) or {}
+    preview_error = st.session_state.get(error_key, '')
+
+    if preview_error:
+        st.error(f'Template PDF preview failed: {preview_error}')
+
+    if preview_exports:
+        st.caption('Read-only preview of the uploaded DOCX template. No generated content has been applied.')
+        _render_readable_pdf_preview(
+            pdf_bytes=preview_exports.get('pdf', b''),
+            fallback_html=preview_exports.get('html', ''),
+            message=preview_exports.get('pdf_message', ''),
+        )
+
+    if preview_error or (preview_exports and not preview_exports.get('pdf')):
+        extracted = str(resolved_upload.get('extracted_text', '') or '').strip()
+        if not extracted:
+            extracted = _extract_docx_text(docx_path)
+        if extracted:
+            st.caption('Text fallback preview from uploaded DOCX:')
+            st.text_area(
+                'Uploaded resume template text',
+                value=extracted,
+                height=320,
+                key=f'{key_prefix}_template_text_fallback',
+                disabled=True,
+            )
+        else:
+            st.info('The uploaded DOCX exists, but text extraction returned no readable text. Use Download uploaded DOCX to open it in WPS/Word.')
+
+
 
 
 def _write_saved_resume_metadata(payload: dict) -> None:
@@ -1282,6 +1394,9 @@ def dashboard_page(user: dict) -> None:
         with toggle_col:
             use_ai = st.toggle('Use OpenAI', value=True, help='If OPENAI_API_KEY is missing, generation falls back automatically.')
 
+        with st.expander('Uploaded resume template preview', expanded=False):
+            _render_uploaded_resume_template_preview(profile, app_settings, 'dashboard_uploaded_template_preview')
+
         target_role = st.text_input('Target role (optional)', value=st.session_state.get('last_target_role', ''), placeholder='Leave blank to let AI infer the best role from the job description')
         job_description = st.text_area('Job description', value=st.session_state.get('last_job_description', ''), height=330, placeholder='Paste the full job description here...')
         custom_prompt = st.text_area('Custom resume prompt (optional)', value=st.session_state.get('last_custom_prompt', ''), height=110, placeholder='Example: Keep the resume sharply aligned to backend ownership, emphasize exact named tech stacks in each company bullet, and avoid generic wording.')
@@ -1527,6 +1642,8 @@ def profile_settings_page(user: dict) -> None:
     upload_info = _resolved_uploaded_resume_record(selected_profile)
     if _profile_has_uploaded_resume(selected_profile):
         st.success(f"resume uploaded: {upload_info.get('filename', 'resume.docx')}")
+        with st.expander('Read uploaded resume template before generate', expanded=False):
+            _render_uploaded_resume_template_preview(selected_profile, storage.get_app_settings(), 'profile_settings_template_preview')
     else:
         st.warning('no resume so must upload resume')
 
@@ -1606,11 +1723,11 @@ def app_settings_page(user: dict) -> None:
     with st.form('app_settings_form'):
         default_prompt = st.text_area('Default prompt', value=settings.get('default_prompt', ''), height=220, placeholder='Default resume guidance that should apply to every generation...')
         download_output_dir = st.text_input('Server save folder (local desktop mode only)', value=settings.get('download_output_dir', 'saved_resumes'), help='Temporary DOCX/PDF files are created server-side before browser download.')
-        pdf_backend_order = st.text_input('PDF backend order', value=settings.get('pdf_backend_order', ', '.join(default_backend_order())), help='Comma-separated. For Windows + WPS, configure wps_custom when docx2pdf/Word is unavailable.')
+        pdf_backend_order = st.text_input('PDF backend order', value=settings.get('pdf_backend_order', 'docx2pdf, word, libreoffice, wps_custom'), help='Comma-separated. For Windows + WPS, configure wps_custom when docx2pdf/Word is unavailable.')
         wps_pdf_command = st.text_input('WPS custom PDF command', value=settings.get('wps_pdf_command', ''), help='Optional. Example: "C:\\Path\\to\\wps_export.bat" "{input}" "{output}"')
         submitted = st.form_submit_button('Save app settings', type='primary')
     if submitted:
-        storage.save_app_settings({'default_prompt': default_prompt.strip(), 'always_clean_generation': True, 'download_output_dir': download_output_dir.strip() or 'saved_resumes', 'pdf_backend_order': pdf_backend_order.strip() or ', '.join(default_backend_order()), 'wps_pdf_command': wps_pdf_command.strip()})
+        storage.save_app_settings({'default_prompt': default_prompt.strip(), 'always_clean_generation': True, 'download_output_dir': download_output_dir.strip() or 'saved_resumes', 'pdf_backend_order': pdf_backend_order.strip() or 'docx2pdf, word, libreoffice, wps_custom', 'wps_pdf_command': wps_pdf_command.strip()})
         st.success('App settings saved.')
         st.rerun()
     with st.expander('Detected PDF export backends'):
