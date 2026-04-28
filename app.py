@@ -41,6 +41,8 @@ APP_DIR = Path(__file__).parent
 storage = Storage(APP_DIR / 'data')
 APP_TITLE = 'TailorResume'
 REGION_OPTIONS = ['Any', 'US', 'EU', 'LATAM']
+LOW_ATS_THRESHOLD = 85
+MAX_LOW_ATS_ATTEMPTS = 2
 
 
 def _normalize_region(value: str) -> str:
@@ -208,6 +210,9 @@ def init_state() -> None:
         'job_list_notice': '',
         'pending_dashboard_approved_job_id': '',
         'auth_token_value': '',
+        'low_ats_attempts_by_job': {},
+        'report_job_dialog_open': False,
+        'report_job_dialog_target_id': '',
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -1233,6 +1238,125 @@ def _review_interview_schedule(item: dict, review_status: str, admin_user: dict,
     _write_saved_resume_metadata(updated)
 
 
+@st.dialog('Report job')
+def _report_job_dialog() -> None:
+    job_id = str(st.session_state.get('report_job_dialog_target_id', '') or '').strip()
+    job = storage.get_job_by_id(job_id) if job_id else None
+    if not job:
+        st.warning('This job is no longer available.')
+        if st.button('Close', use_container_width=True, key='report_job_close_missing'):
+            st.session_state['report_job_dialog_open'] = False
+            st.session_state['report_job_dialog_target_id'] = ''
+            st.rerun()
+        return
+    st.write(f"**{job.get('company', 'Unknown')} — {job.get('job_title', 'Untitled')}**")
+    if job.get('link'):
+        st.caption(job.get('link', ''))
+    reason = st.text_area(
+        'Reason for reporting',
+        key='report_job_reason_value',
+        height=140,
+        placeholder='Example: link is broken, role description is misleading, posting is closed, duplicate, etc.',
+    )
+    submit_col, cancel_col = st.columns(2)
+    with submit_col:
+        if st.button('Submit report', type='primary', use_container_width=True, key='report_job_submit_button'):
+            cleaned_reason = str(reason or '').strip()
+            if not cleaned_reason:
+                st.error('Enter a reason before submitting the report.')
+            else:
+                user = st.session_state.get('current_user_id', '')
+                user_record = storage.get_user_by_id(user) if user else None
+                report_payload = {
+                    'reason': cleaned_reason,
+                    'reported_by_user_id': user,
+                    'reported_by_username': (user_record or {}).get('username', ''),
+                    'reported_at': datetime.utcnow().isoformat() + 'Z',
+                    'source': 'user',
+                }
+                storage.add_job_report(job_id, report_payload)
+                _advance_to_next_dashboard_job(job_id)
+                st.session_state['job_list_notice'] = 'Job reported and flagged for admin review.'
+                st.session_state['saved_resume_notice'] = 'Job reported. Moved to the next job.'
+                st.session_state['report_job_dialog_open'] = False
+                st.session_state['report_job_dialog_target_id'] = ''
+                st.session_state.pop('report_job_reason_value', None)
+                st.rerun()
+    with cancel_col:
+        if st.button('Cancel', use_container_width=True, key='report_job_cancel_button'):
+            st.session_state['report_job_dialog_open'] = False
+            st.session_state['report_job_dialog_target_id'] = ''
+            st.session_state.pop('report_job_reason_value', None)
+            st.rerun()
+
+
+def _enforce_low_ats_rate_limit(user: dict, job_id: str, ats_score: int) -> bool:
+    """Track low-ATS attempts per job and auto-flag when the limit is hit.
+
+    Returns True when the job has been flagged and the dashboard should advance
+    to the next job. Counter is stored in session_state so it resets per
+    session, matching the user-visible "tried twice in a row" expectation.
+    """
+    job_id = str(job_id or '').strip()
+    if not job_id:
+        return False
+    counter_map = st.session_state.setdefault('low_ats_attempts_by_job', {})
+    if ats_score >= LOW_ATS_THRESHOLD:
+        counter_map.pop(job_id, None)
+        return False
+    counter_map[job_id] = int(counter_map.get(job_id, 0) or 0) + 1
+    if counter_map[job_id] < MAX_LOW_ATS_ATTEMPTS:
+        return False
+    auto_reason = (
+        f'Auto-flagged: ATS score stayed below {LOW_ATS_THRESHOLD} '
+        f'after {MAX_LOW_ATS_ATTEMPTS} resume generations '
+        f'(latest score {ats_score}/100). '
+        'Job is under review because the ATS score could not exceed '
+        f'{LOW_ATS_THRESHOLD} after several attempts.'
+    )
+    storage.add_job_report(job_id, {
+        'reason': auto_reason,
+        'reported_by_user_id': (user or {}).get('id', ''),
+        'reported_by_username': (user or {}).get('username', ''),
+        'reported_at': datetime.utcnow().isoformat() + 'Z',
+        'source': 'system',
+    })
+    counter_map.pop(job_id, None)
+    _advance_to_next_dashboard_job(job_id)
+    st.session_state['saved_resume_notice'] = (
+        f'ATS stayed below {LOW_ATS_THRESHOLD} after {MAX_LOW_ATS_ATTEMPTS} attempts. '
+        'Job auto-reported and under review. Moved to the next job.'
+    )
+    return True
+
+
+def _advance_to_next_dashboard_job(current_job_id: str) -> None:
+    user_id = st.session_state.get('current_user_id', '')
+    user_record = storage.get_user_by_id(user_id) if user_id else None
+    if not user_record:
+        return
+    accessible = get_accessible_profiles(user_record)
+    applied_map = _build_applied_map_for_user(user_record, accessible)
+    approved_jobs = storage.get_jobs(include_pending=False)
+    available_jobs = [
+        job for job in approved_jobs
+        if job.get('id') != current_job_id
+        and not job.get('flagged', False)
+        and _job_has_remaining_accessible_profiles(job, accessible, applied_map)
+    ]
+    if available_jobs:
+        st.session_state['pending_dashboard_approved_job_id'] = available_jobs[0].get('id', '')
+    else:
+        st.session_state['last_job_id'] = ''
+        st.session_state['last_job_company'] = ''
+        st.session_state['last_job_link'] = ''
+        st.session_state['last_target_role'] = ''
+        st.session_state['last_job_description'] = ''
+        st.session_state['last_job_region'] = 'ANY'
+    st.session_state['last_resume'] = None
+    st.session_state['last_exports'] = {}
+
+
 @st.dialog('Save application message')
 def _post_download_dialog() -> None:
     payload = st.session_state.get('pending_saved_resume') or {}
@@ -1295,7 +1419,12 @@ def dashboard_page(user: dict) -> None:
             st.session_state['last_job_description'] = pending_job.get('description', '')
             st.session_state['last_job_region'] = _normalize_region(pending_job.get('region', ''))
 
-    available_jobs = [job for job in approved_jobs if _job_has_remaining_accessible_profiles(job, accessible_profiles, applied_map)]
+    available_jobs = [
+        job for job in approved_jobs
+        if not job.get('flagged', False)
+        and not job.get('admin_applied', False)
+        and _job_has_remaining_accessible_profiles(job, accessible_profiles, applied_map)
+    ]
     approved_job_map = {job.get('id', ''): job for job in available_jobs}
     manual_job_option = {'id': '', 'company': '', 'job_title': 'Manual entry', 'description': '', 'link': '', 'region': 'ANY'}
     approved_job_id_options = [''] + [job.get('id', '') for job in available_jobs]
@@ -1342,6 +1471,17 @@ def dashboard_page(user: dict) -> None:
                     next_index = (available_ids.index(current_job_id) + 1) % len(available_ids) if current_job_id in available_ids else 0
                     st.session_state['pending_dashboard_approved_job_id'] = available_ids[next_index]
                     st.rerun()
+            report_disabled = not bool(st.session_state.get('last_job_id', ''))
+            if st.button(
+                'Report job',
+                use_container_width=True,
+                key='dashboard_report_job_button',
+                disabled=report_disabled,
+                help='Report this job link with a reason. Reported jobs are flagged for admin review.',
+            ):
+                st.session_state['report_job_dialog_open'] = True
+                st.session_state['report_job_dialog_target_id'] = st.session_state.get('last_job_id', '')
+                st.rerun()
 
         selected_job_id = selected_job.get('id', '')
         if selected_job_id and selected_job_id != st.session_state.get('last_job_id'):
@@ -1394,8 +1534,9 @@ def dashboard_page(user: dict) -> None:
         with toggle_col:
             use_ai = st.toggle('Use OpenAI', value=True, help='If OPENAI_API_KEY is missing, generation falls back automatically.')
 
-        with st.expander('Uploaded resume template preview', expanded=False):
-            _render_uploaded_resume_template_preview(profile, app_settings, 'dashboard_uploaded_template_preview')
+        if is_admin(user):
+            with st.expander('Uploaded resume template preview', expanded=False):
+                _render_uploaded_resume_template_preview(profile, app_settings, 'dashboard_uploaded_template_preview')
 
         target_role = st.text_input('Target role (optional)', value=st.session_state.get('last_target_role', ''), placeholder='Leave blank to let AI infer the best role from the job description')
         job_description = st.text_area('Job description', value=st.session_state.get('last_job_description', ''), height=330, placeholder='Paste the full job description here...')
@@ -1424,6 +1565,12 @@ def dashboard_page(user: dict) -> None:
                 resume['bold_keywords'] = []
                 resume['auto_bold_fit_keywords'] = False
                 exports = _build_uploaded_docx_pdf_exports(resume=resume, profile=profile, app_settings=app_settings)
+                ats_after_generate = analyze_ats_score(resume, job_description, target_role=target_role)
+            ats_score_now = int((ats_after_generate or {}).get('overall_score', 0))
+            generated_job_id = str(selected_job.get('id', '') or '').strip()
+            if generated_job_id and _enforce_low_ats_rate_limit(user, generated_job_id, ats_score_now):
+                st.rerun()
+                return
             st.session_state['last_resume'] = resume
             st.session_state['last_exports'] = exports
             st.session_state['last_template_id'] = 'uploaded_docx_style'
@@ -1493,17 +1640,21 @@ def dashboard_page(user: dict) -> None:
             if notice:
                 st.success(notice)
             exports = st.session_state['last_exports']
-            tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(['Preview', 'Edit & Fix', 'Exports', 'ATS Notes', 'Job Application Answers', 'Structured Data', 'Source Profile'])
-            with tab1:
+            tab_labels = ['Preview', 'Edit & Fix', 'Exports', 'ATS Notes']
+            if is_admin(user):
+                tab_labels.append('Job Application Answers')
+            tab_labels.extend(['Structured Data', 'Source Profile'])
+            tab_objects = dict(zip(tab_labels, st.tabs(tab_labels)))
+            with tab_objects['Preview']:
                 st.caption('Read-only PDF preview. The PDF is generated from the uploaded DOCX style; only title, summary, skills, and experience content are changed.')
                 _render_readable_pdf_preview(
                     pdf_bytes=(exports or {}).get('pdf', b''),
                     fallback_html=(exports or {}).get('html', ''),
                     message=(exports or {}).get('pdf_message', ''),
                 )
-            with tab2:
+            with tab_objects['Edit & Fix']:
                 _edit_and_fix_tab(current_profile, current_template, st.session_state.get('last_job_description', ''), st.session_state.get('last_target_role', ''), st.session_state.get('last_custom_prompt', ''), default_prompt, use_ai, clean_generation)
-            with tab3:
+            with tab_objects['Exports']:
                 st.markdown('**Download behavior**')
                 pdf_message = (st.session_state.get('last_exports') or {}).get('pdf_message', '')
                 if pdf_message:
@@ -1518,25 +1669,29 @@ def dashboard_page(user: dict) -> None:
                 latest_saved = st.session_state.get('latest_saved_resume_id', '')
                 if latest_saved:
                     st.caption(f'Latest saved resume id: {latest_saved}')
-            with tab4:
+            with tab_objects['ATS Notes']:
                 _dashboard_ats_notes_tab(current_profile, current_template, resume, st.session_state.get('last_job_description', ''), st.session_state.get('last_target_role', ''), st.session_state.get('last_custom_prompt', ''), default_prompt, use_ai, clean_generation)
-            with tab5:
-                _render_application_answers_tab(
-                    resume_snapshot=resume,
-                    job_description=st.session_state.get('last_job_description', ''),
-                    target_role=st.session_state.get('last_target_role', ''),
-                    use_ai=use_ai,
-                    cache_prefix='dashboard_current_resume_answers',
-                )
-            with tab6:
+            if 'Job Application Answers' in tab_objects:
+                with tab_objects['Job Application Answers']:
+                    _render_application_answers_tab(
+                        resume_snapshot=resume,
+                        job_description=st.session_state.get('last_job_description', ''),
+                        target_role=st.session_state.get('last_target_role', ''),
+                        use_ai=use_ai,
+                        cache_prefix='dashboard_current_resume_answers',
+                    )
+            with tab_objects['Structured Data']:
                 st.json(resume)
-            with tab7:
+            with tab_objects['Source Profile']:
                 st.json(current_profile)
         else:
             st.info('Generate a resume from the left panel to see the preview, edit tools, ATS guidance, and export options here.')
 
     if st.session_state.get('pending_saved_resume'):
         _post_download_dialog()
+
+    if st.session_state.get('report_job_dialog_open'):
+        _report_job_dialog()
 
 
 # ---------- Edit / fix ----------
@@ -2175,7 +2330,7 @@ def job_list_page(user: dict) -> None:
     if notice:
         st.success(notice)
 
-    tabs = ['Approved jobs', 'Add job'] + (['Batch presave', 'Pending admin queue'] if is_admin(user) else [])
+    tabs = ['Approved jobs', 'Add job'] + (['Batch presave', 'Pending admin queue', 'Reported jobs'] if is_admin(user) else [])
     rendered_tabs = st.tabs(tabs)
 
     with rendered_tabs[0]:
@@ -2218,6 +2373,59 @@ def job_list_page(user: dict) -> None:
                 with action_col:
                     if st.button('Use in Dashboard', key=f"use_job_{job.get('id')}", use_container_width=True):
                         _load_job_into_dashboard(job)
+                        st.rerun()
+                    if is_admin(user):
+                        edit_key = f'edit_job_open_{job.get("id")}'
+                        confirm_key = f'delete_job_confirm_{job.get("id")}'
+                        if st.button('Edit', key=f"edit_job_{job.get('id')}", use_container_width=True):
+                            st.session_state[edit_key] = not st.session_state.get(edit_key, False)
+                        if st.session_state.get(confirm_key, False):
+                            d_yes, d_no = st.columns(2)
+                            with d_yes:
+                                if st.button('Confirm', key=f"delete_job_yes_{job.get('id')}", type='primary', use_container_width=True):
+                                    storage.delete_job(job.get('id', ''))
+                                    st.session_state.pop(confirm_key, None)
+                                    st.session_state.pop(edit_key, None)
+                                    st.session_state['job_list_notice'] = 'Job deleted.'
+                                    st.rerun()
+                            with d_no:
+                                if st.button('Cancel', key=f"delete_job_no_{job.get('id')}", use_container_width=True):
+                                    st.session_state.pop(confirm_key, None)
+                                    st.rerun()
+                        else:
+                            if st.button('Delete', key=f"delete_job_{job.get('id')}", use_container_width=True):
+                                st.session_state[confirm_key] = True
+                                st.rerun()
+                if is_admin(user) and st.session_state.get(f'edit_job_open_{job.get("id")}', False):
+                    with st.form(key=f"approved_edit_form_{job.get('id')}"):
+                        ec_company = st.text_input('Company', value=job.get('company', ''), key=f"approved_edit_company_{job.get('id')}")
+                        ec_title = st.text_input('Job title', value=job.get('job_title', ''), key=f"approved_edit_title_{job.get('id')}")
+                        ec_link = st.text_input('Link', value=job.get('link', ''), key=f"approved_edit_link_{job.get('id')}")
+                        region_label = _region_label(job.get('region', 'US'))
+                        try:
+                            region_index = REGION_OPTIONS.index(region_label)
+                        except ValueError:
+                            region_index = REGION_OPTIONS.index('US') if 'US' in REGION_OPTIONS else 0
+                        ec_region = st.selectbox('Job market', REGION_OPTIONS, index=region_index, key=f"approved_edit_region_{job.get('id')}")
+                        ec_desc = st.text_area('Description', value=job.get('description', ''), height=240, key=f"approved_edit_desc_{job.get('id')}")
+                        ec_note = st.text_area('Note', value=job.get('note', ''), height=90, key=f"approved_edit_note_{job.get('id')}")
+                        ec_save, ec_cancel = st.columns(2)
+                        save_clicked = ec_save.form_submit_button('Save changes', type='primary', use_container_width=True)
+                        cancel_clicked = ec_cancel.form_submit_button('Close', use_container_width=True)
+                    if save_clicked:
+                        storage.update_job(job.get('id', ''), {
+                            'company': ec_company,
+                            'job_title': ec_title,
+                            'link': ec_link,
+                            'region': _normalize_region(ec_region),
+                            'description': ec_desc,
+                            'note': ec_note,
+                        })
+                        st.session_state[f'edit_job_open_{job.get("id")}'] = False
+                        st.session_state['job_list_notice'] = 'Job updated.'
+                        st.rerun()
+                    if cancel_clicked:
+                        st.session_state[f'edit_job_open_{job.get("id")}'] = False
                         st.rerun()
 
     with rendered_tabs[1]:
@@ -2360,6 +2568,60 @@ def job_list_page(user: dict) -> None:
                         storage.delete_job(job.get('id', ''))
                         st.session_state['job_list_notice'] = 'Pending job deleted.'
                         st.rerun()
+
+        with rendered_tabs[4]:
+            reported_jobs = [
+                job for job in storage.get_jobs(include_pending=True)
+                if ((job.get('reports') or []) or job.get('flagged'))
+                and not job.get('admin_applied', False)
+            ]
+            reported_jobs.sort(
+                key=lambda job: ((job.get('reports') or [{}])[-1].get('reported_at', '')),
+                reverse=True,
+            )
+            if not reported_jobs:
+                st.info('No reported jobs yet.')
+            else:
+                st.caption(f'{len(reported_jobs)} reported job(s). Reports are flagged by users or auto-flagged after repeated low ATS scores.')
+            for job in reported_jobs:
+                reports = job.get('reports', []) or []
+                with st.expander(f"Reported • {_job_summary_label(job)} • {len(reports)} report(s)"):
+                    if job.get('link'):
+                        st.caption(job.get('link', ''))
+                    meta_bits = [f"Status: {job.get('status', 'unknown')}", f"Market: {_region_label(job.get('region', ''))}"]
+                    if job.get('created_by_username'):
+                        meta_bits.append(f"Added by {job.get('created_by_username', '')}")
+                    st.caption(' • '.join(meta_bits))
+                    if not reports:
+                        st.warning('Job is flagged but has no report entries.')
+                    for index, report in enumerate(reports):
+                        source = str(report.get('source', 'user') or 'user').strip()
+                        reporter = report.get('reported_by_username') or ('system' if source == 'system' else 'unknown')
+                        reported_at = report.get('reported_at', '') or 'unknown time'
+                        st.markdown(f"**{index + 1}. {reporter}** ({source}) — `{reported_at}`")
+                        st.write(report.get('reason', ''))
+                    action1, action2, action3 = st.columns(3)
+                    with action1:
+                        if st.button('Dismiss reports & restore', key=f'dismiss_reports_{job.get("id")}', use_container_width=True):
+                            storage.clear_job_reports(job.get('id', ''))
+                            st.session_state['job_list_notice'] = 'Reports cleared and job restored to the active list.'
+                            st.rerun()
+                    with action2:
+                        if st.button('Delete job', key=f'delete_reported_{job.get("id")}', use_container_width=True):
+                            storage.delete_job(job.get('id', ''))
+                            st.session_state['job_list_notice'] = 'Reported job deleted.'
+                            st.rerun()
+                    with action3:
+                        if st.button('Mark as applied by admin', key=f'admin_applied_{job.get("id")}', use_container_width=True):
+                            storage.update_job(job.get('id', ''), {
+                                'admin_applied': True,
+                                'admin_applied_at': datetime.utcnow().isoformat() + 'Z',
+                                'admin_applied_by_user_id': user.get('id', ''),
+                                'admin_applied_by_username': user.get('username', ''),
+                                'flagged': False,
+                            })
+                            st.session_state['job_list_notice'] = 'Job marked as applied by admin and removed from active queue.'
+                            st.rerun()
 
 
 # ---------- Generated resumes ----------
@@ -2590,8 +2852,12 @@ def generated_resumes_page(user: dict) -> None:
                 st.caption('Created by')
                 st.write(item.get('created_by_username', 'n/a'))
 
-            tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(['Snapshot', 'ATS Score', 'Job Application Answers', 'Job Description', 'Interview Schedule', 'Download Resume'])
-            with tab1:
+            saved_tab_labels = ['Snapshot', 'ATS Score']
+            if is_admin(user):
+                saved_tab_labels.append('Job Application Answers')
+            saved_tab_labels.extend(['Job Description', 'Interview Schedule', 'Download Resume'])
+            saved_tabs = dict(zip(saved_tab_labels, st.tabs(saved_tab_labels)))
+            with saved_tabs['Snapshot']:
                 st.write(f"Created: {created_at or 'n/a'}")
                 st.write(f"Resume ID: {item.get('saved_resume_id', 'n/a')}")
                 st.write("Style source: Uploaded DOCX")
@@ -2610,22 +2876,23 @@ def generated_resumes_page(user: dict) -> None:
                         _update_saved_resume_message(item, company_message_value)
                         st.success('Company message saved.')
                         st.rerun()
-            with tab2:
+            with saved_tabs['ATS Score']:
                 analysis = analyze_ats_score(resume_snapshot, job_description, target_role=target_role)
                 _render_ats_analysis(analysis)
-            with tab3:
-                _render_application_answers_tab(
-                    resume_snapshot=resume_snapshot,
-                    job_description=job_description,
-                    target_role=target_role,
-                    use_ai=use_ai,
-                    cache_prefix=f'generated_resume_answers_{item_key}',
-                )
-            with tab4:
+            if 'Job Application Answers' in saved_tabs:
+                with saved_tabs['Job Application Answers']:
+                    _render_application_answers_tab(
+                        resume_snapshot=resume_snapshot,
+                        job_description=job_description,
+                        target_role=target_role,
+                        use_ai=use_ai,
+                        cache_prefix=f'generated_resume_answers_{item_key}',
+                    )
+            with saved_tabs['Job Description']:
                 st.text_area('Job description', value=job_description, height=320, key=f"job_description_snapshot_{item_key}")
-            with tab5:
+            with saved_tabs['Interview Schedule']:
                 _render_interview_schedule_tab(item, item_key, user)
-            with tab6:
+            with saved_tabs['Download Resume']:
                 _render_generated_resume_download_tab(item, resume_snapshot, item_key)
 
 
@@ -2711,6 +2978,13 @@ def _dashboard_ats_notes_tab(profile: dict, template: dict, resume: dict, job_de
         st.session_state['last_exports'] = exports
         st.session_state['last_generator_mode'] = result.get('mode', 'ats-improve')
         st.session_state['last_ats_improve_history'] = result.get('history', [])
+        improved_ats = analyze_ats_score(updated_resume, job_description, target_role=target_role)
+        improved_score = int((improved_ats or {}).get('overall_score', 0))
+        improved_job_id = str(st.session_state.get('last_job_id', '') or '').strip()
+        active_user = storage.get_user_by_id(st.session_state.get('current_user_id', '')) or {}
+        if improved_job_id and _enforce_low_ats_rate_limit(active_user, improved_job_id, improved_score):
+            st.rerun()
+            return
         _queue_editor_reload(updated_resume, 'ATS-guided improvement applied to the current draft.')
         st.rerun()
     history = st.session_state.get('last_ats_improve_history', [])

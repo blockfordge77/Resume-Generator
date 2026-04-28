@@ -733,8 +733,51 @@ class Storage:
                 'approved_by_username': str(item.get('approved_by_username', '')).strip(),
                 'scrape_started_at': str(item.get('scrape_started_at', '')).strip(),
                 'scraped_at': str(item.get('scraped_at', '')).strip(),
+                'reports': self._normalize_job_reports(item.get('reports', []) or []),
+                'flagged': bool(item.get('flagged', False)),
+                'admin_applied': bool(item.get('admin_applied', False)),
+                'admin_applied_at': str(item.get('admin_applied_at', '')).strip(),
+                'admin_applied_by_user_id': str(item.get('admin_applied_by_user_id', '')).strip(),
+                'admin_applied_by_username': str(item.get('admin_applied_by_username', '')).strip(),
             })
         return normalized
+
+    def _normalize_job_reports(self, items: Any) -> list[dict]:
+        normalized: list[dict] = []
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            reason = str(item.get('reason', '')).strip()
+            if not reason:
+                continue
+            normalized.append({
+                'reason': reason,
+                'reported_by_user_id': str(item.get('reported_by_user_id', '')).strip(),
+                'reported_by_username': str(item.get('reported_by_username', '')).strip(),
+                'reported_at': str(item.get('reported_at', '')).strip(),
+                'source': str(item.get('source', 'user') or 'user').strip(),
+            })
+        return normalized
+
+    def add_job_report(self, job_id: str, report: dict) -> None:
+        with self._lock:
+            items = self.get_jobs(include_pending=True)
+            for index, item in enumerate(items):
+                if item.get('id') == job_id:
+                    reports = list(item.get('reports', []) or [])
+                    reports.append(report)
+                    items[index] = self._normalize_jobs([item | {'reports': reports, 'flagged': True}])[0]
+                    self._write_json(self.jobs_path, items)
+                    return
+
+    def clear_job_reports(self, job_id: str) -> None:
+        with self._lock:
+            items = self.get_jobs(include_pending=True)
+            for index, item in enumerate(items):
+                if item.get('id') == job_id:
+                    items[index] = self._normalize_jobs([item | {'reports': [], 'flagged': False}])[0]
+                    self._write_json(self.jobs_path, items)
+                    return
 
 
 def _template_defaults() -> dict:

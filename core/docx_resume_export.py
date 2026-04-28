@@ -219,6 +219,81 @@ def _force_run_bold(run) -> None:
         pass
 
 
+MULTI_WORD_TECH_PHRASES = [
+    "React Native",
+    "React Hooks",
+    "React Router",
+    "React Query",
+    "React Testing Library",
+    "Redux Toolkit",
+    "Redux Saga",
+    "Redux Thunk",
+    "Vue Native",
+    "Vue Router",
+    "Vue Test Utils",
+    "Spring Boot",
+    "Spring Cloud",
+    "Spring Security",
+    "Spring Data",
+    "Apollo Client",
+    "Apollo Server",
+    "Apollo GraphQL",
+    "Material UI",
+    "Tailwind CSS",
+    "Next.js",
+    "Nuxt.js",
+    "Node.js",
+    "Express.js",
+    "Nest.js",
+    "Vue.js",
+    "Ember.js",
+    "Backbone.js",
+    "Three.js",
+    "D3.js",
+    "Socket.IO",
+    "Ruby on Rails",
+    "ASP.NET Core",
+    "Entity Framework",
+    "SQL Server",
+    "Azure DevOps",
+    "Azure Functions",
+    "Cloud Run",
+    "GitHub Actions",
+    "GitLab CI",
+    "Argo CD",
+    "Hugging Face",
+    "OpenAI API",
+    "New Relic",
+    "Key Vault",
+    "Web Components",
+    "Service Worker",
+    "Single Page Application",
+    "Server Side Rendering",
+    "Client Side Rendering",
+]
+
+
+def _expanded_keywords_with_phrases(keywords: list[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for item in keywords or []:
+        clean = str(item).strip()
+        if not clean:
+            continue
+        key = clean.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(clean)
+    base_lower = {kw.lower(): kw for kw in ordered}
+    for phrase in MULTI_WORD_TECH_PHRASES:
+        first_token = phrase.split()[0].lower()
+        if first_token in base_lower and phrase.lower() not in seen:
+            seen.add(phrase.lower())
+            ordered.append(phrase)
+    return ordered
+
+
 def _technical_skill_keywords(resume: dict) -> list[str]:
     ordered: list[str] = []
     seen: set[str] = set()
@@ -230,12 +305,13 @@ def _technical_skill_keywords(resume: dict) -> list[str]:
         if key not in seen:
             seen.add(key)
             ordered.append(clean)
-    return ordered
+    return _expanded_keywords_with_phrases(ordered)
 
 
 def _keyword_pattern(keywords: list[str]) -> re.Pattern[str]:
+    expanded = _expanded_keywords_with_phrases(list(keywords or []))
     clean_keywords = sorted(
-        {str(item).strip() for item in keywords if str(item).strip()},
+        {str(item).strip() for item in expanded if str(item).strip()},
         key=len,
         reverse=True,
     )
