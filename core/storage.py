@@ -47,6 +47,7 @@ class Storage:
         self.settings_path = self.data_dir / 'settings.json'
         self.users_path = self.data_dir / 'users.json'
         self.jobs_path = self.data_dir / 'jobs.json'
+        self.openai_calls_path = self.data_dir / 'openai_calls.json'
         self._lock = threading.RLock()
         self._ensure_defaults()
 
@@ -87,6 +88,9 @@ class Storage:
 
             jobs = self._normalize_jobs(self._read_json(self.jobs_path)) if self.jobs_path.exists() else []
             self._write_json(self.jobs_path, jobs)
+
+            if not self.openai_calls_path.exists():
+                self._write_json(self.openai_calls_path, [])
 
     def _read_json(self, path: Path) -> Any:
         if not path.exists():
@@ -481,6 +485,38 @@ class Storage:
 
     def complete_job_scrape(self, job_id: str, patch: dict) -> None:
         self.update_job(job_id, patch)
+
+    def record_openai_call(self, user_id: str, kind: str = '') -> None:
+        cleaned_user = str(user_id or '').strip()
+        if not cleaned_user:
+            return
+        entry = {
+            'user_id': cleaned_user,
+            'kind': str(kind or '').strip(),
+            'recorded_at': datetime.utcnow().isoformat() + 'Z',
+        }
+        with self._lock:
+            items = self._read_json(self.openai_calls_path) or []
+            if not isinstance(items, list):
+                items = []
+            items.append(entry)
+            self._write_json(self.openai_calls_path, items)
+
+    def get_openai_calls(self) -> list[dict]:
+        with self._lock:
+            items = self._read_json(self.openai_calls_path) or []
+        if not isinstance(items, list):
+            return []
+        normalized: list[dict] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            normalized.append({
+                'user_id': str(item.get('user_id', '')).strip(),
+                'kind': str(item.get('kind', '')).strip(),
+                'recorded_at': str(item.get('recorded_at', '')).strip(),
+            })
+        return normalized
 
     def _parse_iso_datetime(self, value: str) -> datetime | None:
         raw = str(value or '').strip()

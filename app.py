@@ -947,6 +947,7 @@ def _render_application_answers_tab(resume_snapshot: dict, job_description: str,
                     target_role=target_role,
                     use_ai=use_ai,
                 )
+                _record_openai_usage(answer_result, 'application_answers')
             st.session_state['application_answers_cache'][cache_key] = answer_result
     answer_result = st.session_state.get('application_answers_cache', {}).get(cache_key)
     if answer_result:
@@ -1561,6 +1562,7 @@ def dashboard_page(user: dict) -> None:
                     use_ai=use_ai,
                     clean_generation=clean_generation,
                 )
+                _record_openai_usage(result, 'generate_resume')
                 resume = result['resume']
                 resume['bold_keywords'] = []
                 resume['auto_bold_fit_keywords'] = False
@@ -1751,6 +1753,7 @@ def _edit_and_fix_tab(profile: dict, template: dict, job_description: str, targe
         current_draft['auto_bold_fit_keywords'] = bool((st.session_state.get('last_resume') or {}).get('auto_bold_fit_keywords', False))
         with st.spinner('Updating current draft with OpenAI...'):
             result = update_resume_content(profile=profile, job_description=job_description, current_resume=current_draft, fix_prompt=fix_prompt, target_role=target_role, custom_prompt=custom_prompt, default_prompt=default_prompt, use_ai=use_ai, clean_generation=clean_generation)
+            _record_openai_usage(result, 'update_resume')
             updated_resume = result['resume']
             updated_resume['bold_keywords'] = current_draft.get('bold_keywords', [])
             updated_resume['auto_bold_fit_keywords'] = bool(current_draft.get('auto_bold_fit_keywords', False))
@@ -1926,6 +1929,35 @@ def _assigned_profile_help_text(selected_profiles: list[dict], owner_map: dict[s
     return 'Each profile can be assigned to only one user. Profiles already assigned to other users are hidden from this picker.'
 
 
+def _record_openai_usage(result: dict, kind: str) -> None:
+    """Record one OpenAI call for the current user when the result came from a real API call."""
+    mode = str((result or {}).get('mode', '')).strip().lower()
+    if not mode.startswith('openai'):
+        return
+    user_id = str(st.session_state.get('current_user_id', '') or '').strip()
+    if not user_id:
+        return
+    try:
+        storage.record_openai_call(user_id, kind=kind)
+    except Exception:
+        pass
+
+
+def _record_openai_usage_for_improve(result: dict) -> None:
+    """Record one OpenAI call per ATS-improve round that actually hit the API."""
+    user_id = str(st.session_state.get('current_user_id', '') or '').strip()
+    if not user_id:
+        return
+    history = (result or {}).get('history', []) or []
+    for entry in history:
+        round_mode = str((entry or {}).get('mode', '')).strip().lower()
+        if round_mode.startswith('openai'):
+            try:
+                storage.record_openai_call(user_id, kind='ats_improve_round')
+            except Exception:
+                pass
+
+
 def _safe_parse_datetime(value: str) -> datetime | None:
     raw = str(value or '').strip()
     if not raw:
@@ -1994,6 +2026,42 @@ def _metrics_week_selector(rows: list[dict], key: str, label_visibility: str = '
     return week_options[selected_week_label]
 
 
+def _application_metrics_column_config() -> dict:
+    """Annotate each weekly metrics column with a hover description.
+
+    Day columns and the Sum column hold ``applications/openai_calls``; the
+    description is attached to every column header so the format is visible in
+    the table itself instead of relying on an external caption.
+    """
+    day_help = 'Applications saved that day / OpenAI API calls made that day for this user.'
+    config: dict = {
+        'User': st.column_config.TextColumn('User', help='Approved user (full name or username).'),
+        'Mon': st.column_config.TextColumn('Mon', help=day_help),
+        'Tue': st.column_config.TextColumn('Tue', help=day_help),
+        'Wed': st.column_config.TextColumn('Wed', help=day_help),
+        'Thu': st.column_config.TextColumn('Thu', help=day_help),
+        'Fri': st.column_config.TextColumn('Fri', help=day_help),
+        'Sat': st.column_config.TextColumn('Sat', help=day_help),
+        'Sun': st.column_config.TextColumn('Sun', help=day_help),
+        'Sum': st.column_config.TextColumn('Sum', help='Weekly total: applications saved / OpenAI calls.'),
+        'Schedules': st.column_config.NumberColumn('Schedules', help='Interview schedule submissions made this week.'),
+    }
+    return config
+
+
+def _openai_call_index() -> dict[tuple[str, date], int]:
+    """Aggregate OpenAI call counts by (user_id, date)."""
+    index: dict[tuple[str, date], int] = {}
+    for entry in storage.get_openai_calls():
+        recorded_dt = _safe_parse_datetime(entry.get('recorded_at', ''))
+        user_id = str(entry.get('user_id', '') or '').strip()
+        if not recorded_dt or not user_id:
+            continue
+        key = (user_id, recorded_dt.date())
+        index[key] = index.get(key, 0) + 1
+    return index
+
+
 def _build_weekly_summary_rows(rows: list[dict], users: list[dict], selected_week_start: date) -> list[dict]:
     day_offsets = [
         ('Mon', 0),
@@ -2026,17 +2094,23 @@ def _build_weekly_summary_rows(rows: list[dict], users: list[dict], selected_wee
                 total += 1
         return total
 
+    openai_index = _openai_call_index()
+
     summary_rows: list[dict] = []
     for member in users:
         uid = str(member.get('id', ''))
         member_name = member.get('full_name') or member.get('username') or 'Unknown'
         row = {'User': member_name}
-        week_total = 0
+        week_app_total = 0
+        week_openai_total = 0
         for label, offset in day_offsets:
-            count = _day_count(uid, offset)
-            row[label] = count
-            week_total += count
-        row['Sum'] = week_total
+            day_date = selected_week_start + timedelta(days=offset)
+            apps = _day_count(uid, offset)
+            openai_count = int(openai_index.get((uid, day_date), 0))
+            row[label] = f'{apps}/{openai_count}'
+            week_app_total += apps
+            week_openai_total += openai_count
+        row['Sum'] = f'{week_app_total}/{week_openai_total}'
         row['Schedules'] = _schedule_count(uid)
         summary_rows.append(row)
     return sorted(summary_rows, key=lambda item: str(item.get('User', '')).lower())
@@ -2056,7 +2130,12 @@ def _render_application_metrics_tab() -> None:
         selected_week_start = _metrics_week_selector(rows, key='metrics_selected_week')
 
     summary_rows = _build_weekly_summary_rows(rows, users, selected_week_start)
-    st.dataframe(summary_rows, use_container_width=True, hide_index=True)
+    st.dataframe(
+        summary_rows,
+        use_container_width=True,
+        hide_index=True,
+        column_config=_application_metrics_column_config(),
+    )
 
 
 def _render_schedule_reviews_tab(admin_user: dict) -> None:
@@ -2114,7 +2193,12 @@ def my_weekly_result_page(user: dict) -> None:
 
     summary_rows = _build_weekly_summary_rows(rows, [user], selected_week_start)
     if summary_rows:
-        st.dataframe(summary_rows, use_container_width=True, hide_index=True)
+        st.dataframe(
+            summary_rows,
+            use_container_width=True,
+            hide_index=True,
+            column_config=_application_metrics_column_config(),
+        )
     else:
         st.info('No saved applications for the selected week yet.')
 
@@ -2972,6 +3056,7 @@ def _dashboard_ats_notes_tab(profile: dict, template: dict, resume: dict, job_de
             return
         with st.spinner('Improving the current draft against ATS guidance...'):
             result = improve_resume_to_target_ats(profile=profile, job_description=job_description, current_resume=current_resume, target_score=int(target_score), max_rounds=int(max_rounds), additional_requirements=st.session_state.get('dashboard_ats_improve_prompt', ''), target_role=target_role, custom_prompt=custom_prompt, default_prompt=default_prompt, use_ai=use_ai, clean_generation=clean_generation)
+            _record_openai_usage_for_improve(result)
         updated_resume = result.get('resume', current_resume)
         exports = _build_uploaded_docx_pdf_exports(resume=updated_resume, profile=profile, app_settings=storage.get_app_settings())
         st.session_state['last_resume'] = updated_resume
