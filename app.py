@@ -1291,6 +1291,20 @@ def _report_job_dialog() -> None:
             st.rerun()
 
 
+def _job_recency_sort_key(job: dict) -> str:
+    """Sort key that pushes the latest-entered jobs to the top.
+
+    Uses submitted_at when available, falling back to approved_at, then to the
+    job id itself so newly created jobs (whose ids embed a timestamp prefix
+    via ``make_id``) still order after older ones.
+    """
+    return (
+        str(job.get('submitted_at', '') or '').strip()
+        or str(job.get('approved_at', '') or '').strip()
+        or str(job.get('id', '') or '').strip()
+    )
+
+
 def _enforce_low_ats_rate_limit(user: dict, job_id: str, ats_score: int) -> bool:
     """Track low-ATS attempts per job and auto-flag when the limit is hit.
 
@@ -1343,8 +1357,10 @@ def _advance_to_next_dashboard_job(current_job_id: str) -> None:
         job for job in approved_jobs
         if job.get('id') != current_job_id
         and not job.get('flagged', False)
+        and not job.get('admin_applied', False)
         and _job_has_remaining_accessible_profiles(job, accessible, applied_map)
     ]
+    available_jobs.sort(key=_job_recency_sort_key, reverse=True)
     if available_jobs:
         st.session_state['pending_dashboard_approved_job_id'] = available_jobs[0].get('id', '')
     else:
@@ -1426,6 +1442,7 @@ def dashboard_page(user: dict) -> None:
         and not job.get('admin_applied', False)
         and _job_has_remaining_accessible_profiles(job, accessible_profiles, applied_map)
     ]
+    available_jobs.sort(key=_job_recency_sort_key, reverse=True)
     approved_job_map = {job.get('id', ''): job for job in available_jobs}
     manual_job_option = {'id': '', 'company': '', 'job_title': 'Manual entry', 'description': '', 'link': '', 'region': 'ANY'}
     approved_job_id_options = [''] + [job.get('id', '') for job in available_jobs]
@@ -2026,27 +2043,35 @@ def _metrics_week_selector(rows: list[dict], key: str, label_visibility: str = '
     return week_options[selected_week_label]
 
 
-def _application_metrics_column_config() -> dict:
+def _application_metrics_column_config(include_openai: bool = True) -> dict:
     """Annotate each weekly metrics column with a hover description.
 
-    Day columns and the Sum column hold ``applications/openai_calls``; the
-    description is attached to every column header so the format is visible in
-    the table itself instead of relying on an external caption.
+    Admin view (``include_openai=True``) shows ``applications/openai_calls`` per
+    day. User view (``include_openai=False``) shows applications only — the
+    OpenAI call counts are admin-internal data.
     """
-    day_help = 'Applications saved that day / OpenAI API calls made that day for this user.'
-    config: dict = {
+    if include_openai:
+        day_help = 'Applications saved that day / OpenAI API calls made that day for this user.'
+        sum_help = 'Weekly total: applications saved / OpenAI calls.'
+        day_column = lambda label: st.column_config.TextColumn(label, help=day_help)
+        sum_column = st.column_config.TextColumn('Sum', help=sum_help)
+    else:
+        day_help = 'Applications saved that day.'
+        sum_help = 'Weekly total of applications saved.'
+        day_column = lambda label: st.column_config.NumberColumn(label, help=day_help)
+        sum_column = st.column_config.NumberColumn('Sum', help=sum_help)
+    return {
         'User': st.column_config.TextColumn('User', help='Approved user (full name or username).'),
-        'Mon': st.column_config.TextColumn('Mon', help=day_help),
-        'Tue': st.column_config.TextColumn('Tue', help=day_help),
-        'Wed': st.column_config.TextColumn('Wed', help=day_help),
-        'Thu': st.column_config.TextColumn('Thu', help=day_help),
-        'Fri': st.column_config.TextColumn('Fri', help=day_help),
-        'Sat': st.column_config.TextColumn('Sat', help=day_help),
-        'Sun': st.column_config.TextColumn('Sun', help=day_help),
-        'Sum': st.column_config.TextColumn('Sum', help='Weekly total: applications saved / OpenAI calls.'),
+        'Mon': day_column('Mon'),
+        'Tue': day_column('Tue'),
+        'Wed': day_column('Wed'),
+        'Thu': day_column('Thu'),
+        'Fri': day_column('Fri'),
+        'Sat': day_column('Sat'),
+        'Sun': day_column('Sun'),
+        'Sum': sum_column,
         'Schedules': st.column_config.NumberColumn('Schedules', help='Interview schedule submissions made this week.'),
     }
-    return config
 
 
 def _openai_call_index() -> dict[tuple[str, date], int]:
@@ -2062,7 +2087,7 @@ def _openai_call_index() -> dict[tuple[str, date], int]:
     return index
 
 
-def _build_weekly_summary_rows(rows: list[dict], users: list[dict], selected_week_start: date) -> list[dict]:
+def _build_weekly_summary_rows(rows: list[dict], users: list[dict], selected_week_start: date, include_openai: bool = True) -> list[dict]:
     day_offsets = [
         ('Mon', 0),
         ('Tue', 1),
@@ -2094,7 +2119,7 @@ def _build_weekly_summary_rows(rows: list[dict], users: list[dict], selected_wee
                 total += 1
         return total
 
-    openai_index = _openai_call_index()
+    openai_index = _openai_call_index() if include_openai else {}
 
     summary_rows: list[dict] = []
     for member in users:
@@ -2106,11 +2131,14 @@ def _build_weekly_summary_rows(rows: list[dict], users: list[dict], selected_wee
         for label, offset in day_offsets:
             day_date = selected_week_start + timedelta(days=offset)
             apps = _day_count(uid, offset)
-            openai_count = int(openai_index.get((uid, day_date), 0))
-            row[label] = f'{apps}/{openai_count}'
+            if include_openai:
+                openai_count = int(openai_index.get((uid, day_date), 0))
+                row[label] = f'{apps}/{openai_count}'
+                week_openai_total += openai_count
+            else:
+                row[label] = apps
             week_app_total += apps
-            week_openai_total += openai_count
-        row['Sum'] = f'{week_app_total}/{week_openai_total}'
+        row['Sum'] = f'{week_app_total}/{week_openai_total}' if include_openai else week_app_total
         row['Schedules'] = _schedule_count(uid)
         summary_rows.append(row)
     return sorted(summary_rows, key=lambda item: str(item.get('User', '')).lower())
@@ -2191,13 +2219,13 @@ def my_weekly_result_page(user: dict) -> None:
     with week_col:
         selected_week_start = _metrics_week_selector(rows, key='my_weekly_result_week')
 
-    summary_rows = _build_weekly_summary_rows(rows, [user], selected_week_start)
+    summary_rows = _build_weekly_summary_rows(rows, [user], selected_week_start, include_openai=False)
     if summary_rows:
         st.dataframe(
             summary_rows,
             use_container_width=True,
             hide_index=True,
-            column_config=_application_metrics_column_config(),
+            column_config=_application_metrics_column_config(include_openai=False),
         )
     else:
         st.info('No saved applications for the selected week yet.')
