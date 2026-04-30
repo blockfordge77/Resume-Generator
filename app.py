@@ -1562,7 +1562,12 @@ def dashboard_page(user: dict) -> None:
             st.rerun()
 
         if selected_job_id and selected_job.get('link'):
-            _render_copy_value_notice('Job link', selected_job.get('link', ''), 'Click this job link box to copy the URL.')
+            st.link_button(
+                'Open job posting in new tab ↗',
+                selected_job.get('link', ''),
+                use_container_width=True,
+                help=selected_job.get('link', ''),
+            )
 
         current_job_region = _normalize_region(selected_job.get('region', st.session_state.get('last_job_region', 'ANY')) if selected_job_id else st.session_state.get('last_job_region', 'ANY'))
 
