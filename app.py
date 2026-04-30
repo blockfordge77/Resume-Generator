@@ -18,7 +18,7 @@ from urllib import request as urlrequest
 import streamlit as st
 from dotenv import load_dotenv
 
-from core.docx_resume_export import build_docx_style_pdf_bundle, default_backend_order, pdf_backend_status
+from core.docx_resume_export import build_docx_style_pdf_bundle, build_docx_template_pdf_bundle, pdf_backend_status
 from core.resume_engine import (
     analyze_ats_score,
     generate_application_answers,
@@ -41,6 +41,8 @@ APP_DIR = Path(__file__).parent
 storage = Storage(APP_DIR / 'data')
 APP_TITLE = 'TailorResume'
 REGION_OPTIONS = ['Any', 'US', 'EU', 'LATAM']
+LOW_ATS_THRESHOLD = 85
+MAX_LOW_ATS_ATTEMPTS = 2
 
 
 def _normalize_region(value: str) -> str:
@@ -208,6 +210,9 @@ def init_state() -> None:
         'job_list_notice': '',
         'pending_dashboard_approved_job_id': '',
         'auth_token_value': '',
+        'low_ats_attempts_by_job': {},
+        'report_job_dialog_open': False,
+        'report_job_dialog_target_id': '',
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -867,7 +872,7 @@ def _pdf_export_config(settings: dict) -> dict:
     order_raw = str(settings.get('pdf_backend_order', '') or '').strip()
     backend_order = [item.strip() for item in order_raw.split(',') if item.strip()]
     if not backend_order:
-        backend_order = default_backend_order()
+        backend_order = ['docx2pdf', 'word', 'libreoffice', 'wps_custom']
     return {
         'backend_order': backend_order,
         'wps_pdf_command': str(settings.get('wps_pdf_command', '') or '').strip(),
@@ -886,6 +891,36 @@ def _build_uploaded_docx_pdf_exports(resume: dict, profile: dict, app_settings: 
         output_dir=_resolve_output_dir(app_settings.get('download_output_dir', 'saved_resumes')),
         pdf_cfg=_pdf_export_config(app_settings),
     )
+
+
+def _build_uploaded_docx_template_pdf_exports(profile: dict, app_settings: dict) -> dict:
+    """Create a read-only PDF preview of the selected profile's uploaded DOCX.
+
+    This preview runs before resume generation. It must not apply generated
+    content, replace placeholders, or modify the uploaded template file.
+    """
+    resolved_upload = _resolved_uploaded_resume_record(profile)
+    path_value = str((resolved_upload or {}).get('path', '') or '').strip()
+    if not resolved_upload or not path_value or not Path(path_value).exists():
+        raise FileNotFoundError('no resume so must upload resume')
+    export_profile = copy.deepcopy(profile)
+    export_profile['uploaded_resume'] = resolved_upload
+    return build_docx_template_pdf_bundle(
+        profile=export_profile,
+        output_dir=_resolve_output_dir(app_settings.get('download_output_dir', 'saved_resumes')),
+        pdf_cfg=_pdf_export_config(app_settings),
+    )
+
+
+def _uploaded_resume_signature(profile: dict) -> str:
+    path = _resolve_uploaded_resume_path(profile)
+    if not path:
+        return f"{profile.get('id', '')}|missing"
+    try:
+        stat = path.stat()
+        return f"{profile.get('id', '')}|{path}|{stat.st_size}|{stat.st_mtime_ns}"
+    except OSError:
+        return f"{profile.get('id', '')}|{path}|unknown"
 
 
 def _render_application_answers_tab(resume_snapshot: dict, job_description: str, target_role: str, use_ai: bool, cache_prefix: str, default_questions: str | None = None) -> None:
@@ -912,6 +947,7 @@ def _render_application_answers_tab(resume_snapshot: dict, job_description: str,
                     target_role=target_role,
                     use_ai=use_ai,
                 )
+                _record_openai_usage(answer_result, 'application_answers')
             st.session_state['application_answers_cache'][cache_key] = answer_result
     answer_result = st.session_state.get('application_answers_cache', {}).get(cache_key)
     if answer_result:
@@ -962,6 +998,88 @@ def _render_readable_pdf_preview(pdf_bytes: bytes, fallback_html: str = '', mess
             st.components.v1.html(fallback_html, height=1180, scrolling=True)
 
 
+def _render_uploaded_resume_template_preview(profile: dict, app_settings: dict, key_prefix: str) -> None:
+    """Render a read-only preview for the selected profile's uploaded DOCX."""
+    resolved_upload = _resolved_uploaded_resume_record(profile)
+    docx_path = _resolve_uploaded_resume_path(profile)
+
+    if not docx_path:
+        st.warning('no resume so must upload resume')
+        return
+
+    signature = _uploaded_resume_signature(profile)
+    sig_key = f'{key_prefix}_template_preview_signature'
+    preview_key = f'{key_prefix}_template_preview_exports'
+    error_key = f'{key_prefix}_template_preview_error'
+
+    if st.session_state.get(sig_key) != signature:
+        st.session_state[sig_key] = signature
+        st.session_state.pop(preview_key, None)
+        st.session_state.pop(error_key, None)
+
+    filename = str(resolved_upload.get('filename', '') or docx_path.name)
+    size_bytes = int(resolved_upload.get('size_bytes', 0) or 0)
+    size_label = f"{size_bytes / 1024:.1f} KB" if size_bytes else "unknown size"
+
+    info_col, action_col = st.columns([2.2, 1.0], gap='small')
+    with info_col:
+        st.caption(f"Uploaded DOCX: {filename} • {size_label}")
+        st.caption('Preview is read-only and uses the selected profile resume template before generation.')
+    with action_col:
+        try:
+            st.download_button(
+                'Download uploaded DOCX',
+                data=docx_path.read_bytes(),
+                file_name=filename,
+                mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                use_container_width=True,
+                key=f'{key_prefix}_download_uploaded_docx',
+            )
+        except Exception as exc:
+            st.warning(f'Could not prepare DOCX download: {exc}')
+
+    if st.button('Read uploaded resume template', key=f'{key_prefix}_read_template_button', use_container_width=True):
+        try:
+            with st.spinner('Creating read-only template preview...'):
+                st.session_state[preview_key] = _build_uploaded_docx_template_pdf_exports(profile, app_settings)
+                st.session_state.pop(error_key, None)
+        except Exception as exc:
+            st.session_state[preview_key] = {}
+            st.session_state[error_key] = str(exc)
+
+    preview_exports = st.session_state.get(preview_key) or {}
+    preview_error = st.session_state.get(error_key, '')
+
+    if preview_error:
+        st.error(f'Template PDF preview failed: {preview_error}')
+
+    if preview_exports:
+        st.caption('Read-only preview of the uploaded DOCX template. No generated content has been applied.')
+        _render_readable_pdf_preview(
+            pdf_bytes=preview_exports.get('pdf', b''),
+            fallback_html=preview_exports.get('html', ''),
+            message=preview_exports.get('pdf_message', ''),
+        )
+
+    if preview_error or (preview_exports and not preview_exports.get('pdf')):
+        extracted = str(resolved_upload.get('extracted_text', '') or '').strip()
+        if not extracted:
+            extracted = _extract_docx_text(docx_path)
+        if extracted:
+            st.caption('Text fallback preview from uploaded DOCX:')
+            st.text_area(
+                'Uploaded resume template text',
+                value=extracted,
+                height=320,
+                key=f'{key_prefix}_template_text_fallback',
+                disabled=True,
+            )
+        else:
+            st.info('The uploaded DOCX exists, but text extraction returned no readable text. Use Download uploaded DOCX to open it in WPS/Word.')
+
+
+
+
 def _write_saved_resume_metadata(payload: dict) -> None:
     folder = Path(payload.get('saved_folder', ''))
     if not str(folder):
@@ -982,15 +1100,32 @@ def _compact_resume_snapshot(resume: dict) -> dict:
         'summary': str(source.get('summary', '')).strip(),
         'fit_keywords': [str(item).strip() for item in source.get('fit_keywords', []) if str(item).strip()],
         'technical_skills': [str(item).strip() for item in source.get('technical_skills', []) if str(item).strip()],
-        'grouped_skills': {},
+        'skill_groups': [],
+        'bold_keywords': [str(item).strip() for item in source.get('bold_keywords', []) if str(item).strip()],
+        'auto_bold_fit_keywords': bool(source.get('auto_bold_fit_keywords', False)),
         'work_history': [],
         'education_history': [],
     }
-    grouped_skills = source.get('grouped_skills', {}) or {}
-    for key, values in grouped_skills.items():
-        cleaned_values = [str(item).strip() for item in values or [] if str(item).strip()]
-        if cleaned_values:
-            compact['grouped_skills'][str(key).strip() or 'Other Relevant'] = cleaned_values
+    raw_groups = source.get('skill_groups')
+    if isinstance(raw_groups, list):
+        for group in raw_groups:
+            if not isinstance(group, dict):
+                continue
+            category = str(group.get('category', '')).strip() or 'Other Relevant'
+            items = [str(v).strip() for v in group.get('items', []) or [] if str(v).strip()]
+            if items:
+                compact['skill_groups'].append({'category': category, 'items': items})
+    elif isinstance(raw_groups, dict):
+        for key, values in raw_groups.items():
+            items = [str(v).strip() for v in values or [] if str(v).strip()]
+            if items:
+                compact['skill_groups'].append({'category': str(key).strip() or 'Other Relevant', 'items': items})
+    legacy_grouped = source.get('grouped_skills')
+    if not compact['skill_groups'] and isinstance(legacy_grouped, dict):
+        for key, values in legacy_grouped.items():
+            items = [str(v).strip() for v in values or [] if str(v).strip()]
+            if items:
+                compact['skill_groups'].append({'category': str(key).strip() or 'Other Relevant', 'items': items})
     for item in source.get('work_history', []) or []:
         compact['work_history'].append({
             'company_name': str(item.get('company_name', '')).strip(),
@@ -1010,12 +1145,36 @@ def _compact_resume_snapshot(resume: dict) -> dict:
     return compact
 
 
+def _saved_resume_pdf_dir() -> Path:
+    folder = APP_DIR / 'data' / 'saved_resume_pdfs'
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def _saved_resume_pdf_path_for(saved_resume_id: str) -> Path:
+    return _saved_resume_pdf_dir() / f'{saved_resume_id}.pdf'
+
+
+def _persist_saved_resume_pdf(saved_resume_id: str, pdf_bytes: bytes) -> str:
+    if not saved_resume_id or not pdf_bytes:
+        return ''
+    target = _saved_resume_pdf_path_for(saved_resume_id)
+    target.write_bytes(pdf_bytes)
+    try:
+        return str(target.resolve().relative_to((APP_DIR / 'data').resolve()))
+    except Exception:
+        return str(target)
+
+
 def _saved_resume_payload(user: dict, profile: dict, template: dict, resume: dict, ats_analysis: dict, exports: dict, app_settings: dict) -> dict:
     saved_resume_id = storage.make_id('resume')
     created_at = datetime.utcnow().isoformat() + 'Z'
 
     file_stem = _build_file_stem(profile)
     pdf_name = f'{file_stem}.pdf'
+
+    pdf_bytes = (exports or {}).get('pdf') or b''
+    saved_pdf_path = _persist_saved_resume_pdf(saved_resume_id, pdf_bytes) if pdf_bytes else ''
 
     payload = {
         'saved_resume_id': saved_resume_id,
@@ -1038,6 +1197,7 @@ def _saved_resume_payload(user: dict, profile: dict, template: dict, resume: dic
         'download_mode': 'browser',
         'company_message': '',
         'company_message_status': 'pending',
+        'saved_pdf_path': saved_pdf_path,
     }
     return payload
 
@@ -1121,6 +1281,141 @@ def _review_interview_schedule(item: dict, review_status: str, admin_user: dict,
     _write_saved_resume_metadata(updated)
 
 
+@st.dialog('Report job')
+def _report_job_dialog() -> None:
+    job_id = str(st.session_state.get('report_job_dialog_target_id', '') or '').strip()
+    job = storage.get_job_by_id(job_id) if job_id else None
+    if not job:
+        st.warning('This job is no longer available.')
+        if st.button('Close', use_container_width=True, key='report_job_close_missing'):
+            st.session_state['report_job_dialog_open'] = False
+            st.session_state['report_job_dialog_target_id'] = ''
+            st.rerun()
+        return
+    st.write(f"**{job.get('company', 'Unknown')} — {job.get('job_title', 'Untitled')}**")
+    if job.get('link'):
+        st.caption(job.get('link', ''))
+    reason = st.text_area(
+        'Reason for reporting',
+        key='report_job_reason_value',
+        height=140,
+        placeholder='Example: link is broken, role description is misleading, posting is closed, duplicate, etc.',
+    )
+    submit_col, cancel_col = st.columns(2)
+    with submit_col:
+        if st.button('Submit report', type='primary', use_container_width=True, key='report_job_submit_button'):
+            cleaned_reason = str(reason or '').strip()
+            if not cleaned_reason:
+                st.error('Enter a reason before submitting the report.')
+            else:
+                user = st.session_state.get('current_user_id', '')
+                user_record = storage.get_user_by_id(user) if user else None
+                report_payload = {
+                    'reason': cleaned_reason,
+                    'reported_by_user_id': user,
+                    'reported_by_username': (user_record or {}).get('username', ''),
+                    'reported_at': datetime.utcnow().isoformat() + 'Z',
+                    'source': 'user',
+                }
+                storage.add_job_report(job_id, report_payload)
+                _advance_to_next_dashboard_job(job_id)
+                st.session_state['job_list_notice'] = 'Job reported and flagged for admin review.'
+                st.session_state['saved_resume_notice'] = 'Job reported. Moved to the next job.'
+                st.session_state['report_job_dialog_open'] = False
+                st.session_state['report_job_dialog_target_id'] = ''
+                st.session_state.pop('report_job_reason_value', None)
+                st.rerun()
+    with cancel_col:
+        if st.button('Cancel', use_container_width=True, key='report_job_cancel_button'):
+            st.session_state['report_job_dialog_open'] = False
+            st.session_state['report_job_dialog_target_id'] = ''
+            st.session_state.pop('report_job_reason_value', None)
+            st.rerun()
+
+
+def _job_recency_sort_key(job: dict) -> str:
+    """Sort key that pushes the latest-entered jobs to the top.
+
+    Uses submitted_at when available, falling back to approved_at, then to the
+    job id itself so newly created jobs (whose ids embed a timestamp prefix
+    via ``make_id``) still order after older ones.
+    """
+    return (
+        str(job.get('submitted_at', '') or '').strip()
+        or str(job.get('approved_at', '') or '').strip()
+        or str(job.get('id', '') or '').strip()
+    )
+
+
+def _enforce_low_ats_rate_limit(user: dict, job_id: str, ats_score: int) -> bool:
+    """Track low-ATS attempts per job and auto-flag when the limit is hit.
+
+    Returns True when the job has been flagged and the dashboard should advance
+    to the next job. Counter is stored in session_state so it resets per
+    session, matching the user-visible "tried twice in a row" expectation.
+    """
+    job_id = str(job_id or '').strip()
+    if not job_id:
+        return False
+    counter_map = st.session_state.setdefault('low_ats_attempts_by_job', {})
+    if ats_score >= LOW_ATS_THRESHOLD:
+        counter_map.pop(job_id, None)
+        return False
+    counter_map[job_id] = int(counter_map.get(job_id, 0) or 0) + 1
+    if counter_map[job_id] < MAX_LOW_ATS_ATTEMPTS:
+        return False
+    auto_reason = (
+        f'Auto-flagged: ATS score stayed below {LOW_ATS_THRESHOLD} '
+        f'after {MAX_LOW_ATS_ATTEMPTS} resume generations '
+        f'(latest score {ats_score}/100). '
+        'Job is under review because the ATS score could not exceed '
+        f'{LOW_ATS_THRESHOLD} after several attempts.'
+    )
+    storage.add_job_report(job_id, {
+        'reason': auto_reason,
+        'reported_by_user_id': (user or {}).get('id', ''),
+        'reported_by_username': (user or {}).get('username', ''),
+        'reported_at': datetime.utcnow().isoformat() + 'Z',
+        'source': 'system',
+    })
+    counter_map.pop(job_id, None)
+    _advance_to_next_dashboard_job(job_id)
+    st.session_state['saved_resume_notice'] = (
+        f'ATS stayed below {LOW_ATS_THRESHOLD} after {MAX_LOW_ATS_ATTEMPTS} attempts. '
+        'Job auto-reported and under review. Moved to the next job.'
+    )
+    return True
+
+
+def _advance_to_next_dashboard_job(current_job_id: str) -> None:
+    user_id = st.session_state.get('current_user_id', '')
+    user_record = storage.get_user_by_id(user_id) if user_id else None
+    if not user_record:
+        return
+    accessible = get_accessible_profiles(user_record)
+    applied_map = _build_applied_map_for_user(user_record, accessible)
+    approved_jobs = storage.get_jobs(include_pending=False)
+    available_jobs = [
+        job for job in approved_jobs
+        if job.get('id') != current_job_id
+        and not job.get('flagged', False)
+        and not job.get('admin_applied', False)
+        and _job_has_remaining_accessible_profiles(job, accessible, applied_map)
+    ]
+    available_jobs.sort(key=_job_recency_sort_key, reverse=True)
+    if available_jobs:
+        st.session_state['pending_dashboard_approved_job_id'] = available_jobs[0].get('id', '')
+    else:
+        st.session_state['last_job_id'] = ''
+        st.session_state['last_job_company'] = ''
+        st.session_state['last_job_link'] = ''
+        st.session_state['last_target_role'] = ''
+        st.session_state['last_job_description'] = ''
+        st.session_state['last_job_region'] = 'ANY'
+    st.session_state['last_resume'] = None
+    st.session_state['last_exports'] = {}
+
+
 @st.dialog('Save application message')
 def _post_download_dialog() -> None:
     payload = st.session_state.get('pending_saved_resume') or {}
@@ -1183,7 +1478,13 @@ def dashboard_page(user: dict) -> None:
             st.session_state['last_job_description'] = pending_job.get('description', '')
             st.session_state['last_job_region'] = _normalize_region(pending_job.get('region', ''))
 
-    available_jobs = [job for job in approved_jobs if _job_has_remaining_accessible_profiles(job, accessible_profiles, applied_map)]
+    available_jobs = [
+        job for job in approved_jobs
+        if not job.get('flagged', False)
+        and not job.get('admin_applied', False)
+        and _job_has_remaining_accessible_profiles(job, accessible_profiles, applied_map)
+    ]
+    available_jobs.sort(key=_job_recency_sort_key, reverse=True)
     approved_job_map = {job.get('id', ''): job for job in available_jobs}
     manual_job_option = {'id': '', 'company': '', 'job_title': 'Manual entry', 'description': '', 'link': '', 'region': 'ANY'}
     approved_job_id_options = [''] + [job.get('id', '') for job in available_jobs]
@@ -1230,6 +1531,17 @@ def dashboard_page(user: dict) -> None:
                     next_index = (available_ids.index(current_job_id) + 1) % len(available_ids) if current_job_id in available_ids else 0
                     st.session_state['pending_dashboard_approved_job_id'] = available_ids[next_index]
                     st.rerun()
+            report_disabled = not bool(st.session_state.get('last_job_id', ''))
+            if st.button(
+                'Report job',
+                use_container_width=True,
+                key='dashboard_report_job_button',
+                disabled=report_disabled,
+                help='Report this job link with a reason. Reported jobs are flagged for admin review.',
+            ):
+                st.session_state['report_job_dialog_open'] = True
+                st.session_state['report_job_dialog_target_id'] = st.session_state.get('last_job_id', '')
+                st.rerun()
 
         selected_job_id = selected_job.get('id', '')
         if selected_job_id and selected_job_id != st.session_state.get('last_job_id'):
@@ -1250,7 +1562,12 @@ def dashboard_page(user: dict) -> None:
             st.rerun()
 
         if selected_job_id and selected_job.get('link'):
-            _render_copy_value_notice('Job link', selected_job.get('link', ''), 'Click this job link box to copy the URL.')
+            st.link_button(
+                'Open job posting in new tab ↗',
+                selected_job.get('link', ''),
+                use_container_width=True,
+                help=selected_job.get('link', ''),
+            )
 
         current_job_region = _normalize_region(selected_job.get('region', st.session_state.get('last_job_region', 'ANY')) if selected_job_id else st.session_state.get('last_job_region', 'ANY'))
 
@@ -1282,6 +1599,10 @@ def dashboard_page(user: dict) -> None:
         with toggle_col:
             use_ai = st.toggle('Use OpenAI', value=True, help='If OPENAI_API_KEY is missing, generation falls back automatically.')
 
+        if is_admin(user):
+            with st.expander('Uploaded resume template preview', expanded=False):
+                _render_uploaded_resume_template_preview(profile, app_settings, 'dashboard_uploaded_template_preview')
+
         target_role = st.text_input('Target role (optional)', value=st.session_state.get('last_target_role', ''), placeholder='Leave blank to let AI infer the best role from the job description')
         job_description = st.text_area('Job description', value=st.session_state.get('last_job_description', ''), height=330, placeholder='Paste the full job description here...')
         custom_prompt = st.text_area('Custom resume prompt (optional)', value=st.session_state.get('last_custom_prompt', ''), height=110, placeholder='Example: Keep the resume sharply aligned to backend ownership, emphasize exact named tech stacks in each company bullet, and avoid generic wording.')
@@ -1305,10 +1626,17 @@ def dashboard_page(user: dict) -> None:
                     use_ai=use_ai,
                     clean_generation=clean_generation,
                 )
+                _record_openai_usage(result, 'generate_resume')
                 resume = result['resume']
                 resume['bold_keywords'] = []
                 resume['auto_bold_fit_keywords'] = False
                 exports = _build_uploaded_docx_pdf_exports(resume=resume, profile=profile, app_settings=app_settings)
+                ats_after_generate = analyze_ats_score(resume, job_description, target_role=target_role)
+            ats_score_now = int((ats_after_generate or {}).get('overall_score', 0))
+            generated_job_id = str(selected_job.get('id', '') or '').strip()
+            if generated_job_id and _enforce_low_ats_rate_limit(user, generated_job_id, ats_score_now):
+                st.rerun()
+                return
             st.session_state['last_resume'] = resume
             st.session_state['last_exports'] = exports
             st.session_state['last_template_id'] = 'uploaded_docx_style'
@@ -1378,17 +1706,21 @@ def dashboard_page(user: dict) -> None:
             if notice:
                 st.success(notice)
             exports = st.session_state['last_exports']
-            tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(['Preview', 'Edit & Fix', 'Exports', 'ATS Notes', 'Job Application Answers', 'Structured Data', 'Source Profile'])
-            with tab1:
+            tab_labels = ['Preview', 'Edit & Fix', 'Exports', 'ATS Notes']
+            if is_admin(user):
+                tab_labels.append('Job Application Answers')
+            tab_labels.extend(['Structured Data', 'Source Profile'])
+            tab_objects = dict(zip(tab_labels, st.tabs(tab_labels)))
+            with tab_objects['Preview']:
                 st.caption('Read-only PDF preview. The PDF is generated from the uploaded DOCX style; only title, summary, skills, and experience content are changed.')
                 _render_readable_pdf_preview(
                     pdf_bytes=(exports or {}).get('pdf', b''),
                     fallback_html=(exports or {}).get('html', ''),
                     message=(exports or {}).get('pdf_message', ''),
                 )
-            with tab2:
+            with tab_objects['Edit & Fix']:
                 _edit_and_fix_tab(current_profile, current_template, st.session_state.get('last_job_description', ''), st.session_state.get('last_target_role', ''), st.session_state.get('last_custom_prompt', ''), default_prompt, use_ai, clean_generation)
-            with tab3:
+            with tab_objects['Exports']:
                 st.markdown('**Download behavior**')
                 pdf_message = (st.session_state.get('last_exports') or {}).get('pdf_message', '')
                 if pdf_message:
@@ -1403,25 +1735,29 @@ def dashboard_page(user: dict) -> None:
                 latest_saved = st.session_state.get('latest_saved_resume_id', '')
                 if latest_saved:
                     st.caption(f'Latest saved resume id: {latest_saved}')
-            with tab4:
+            with tab_objects['ATS Notes']:
                 _dashboard_ats_notes_tab(current_profile, current_template, resume, st.session_state.get('last_job_description', ''), st.session_state.get('last_target_role', ''), st.session_state.get('last_custom_prompt', ''), default_prompt, use_ai, clean_generation)
-            with tab5:
-                _render_application_answers_tab(
-                    resume_snapshot=resume,
-                    job_description=st.session_state.get('last_job_description', ''),
-                    target_role=st.session_state.get('last_target_role', ''),
-                    use_ai=use_ai,
-                    cache_prefix='dashboard_current_resume_answers',
-                )
-            with tab6:
+            if 'Job Application Answers' in tab_objects:
+                with tab_objects['Job Application Answers']:
+                    _render_application_answers_tab(
+                        resume_snapshot=resume,
+                        job_description=st.session_state.get('last_job_description', ''),
+                        target_role=st.session_state.get('last_target_role', ''),
+                        use_ai=use_ai,
+                        cache_prefix='dashboard_current_resume_answers',
+                    )
+            with tab_objects['Structured Data']:
                 st.json(resume)
-            with tab7:
+            with tab_objects['Source Profile']:
                 st.json(current_profile)
         else:
             st.info('Generate a resume from the left panel to see the preview, edit tools, ATS guidance, and export options here.')
 
     if st.session_state.get('pending_saved_resume'):
         _post_download_dialog()
+
+    if st.session_state.get('report_job_dialog_open'):
+        _report_job_dialog()
 
 
 # ---------- Edit / fix ----------
@@ -1481,6 +1817,7 @@ def _edit_and_fix_tab(profile: dict, template: dict, job_description: str, targe
         current_draft['auto_bold_fit_keywords'] = bool((st.session_state.get('last_resume') or {}).get('auto_bold_fit_keywords', False))
         with st.spinner('Updating current draft with OpenAI...'):
             result = update_resume_content(profile=profile, job_description=job_description, current_resume=current_draft, fix_prompt=fix_prompt, target_role=target_role, custom_prompt=custom_prompt, default_prompt=default_prompt, use_ai=use_ai, clean_generation=clean_generation)
+            _record_openai_usage(result, 'update_resume')
             updated_resume = result['resume']
             updated_resume['bold_keywords'] = current_draft.get('bold_keywords', [])
             updated_resume['auto_bold_fit_keywords'] = bool(current_draft.get('auto_bold_fit_keywords', False))
@@ -1527,6 +1864,8 @@ def profile_settings_page(user: dict) -> None:
     upload_info = _resolved_uploaded_resume_record(selected_profile)
     if _profile_has_uploaded_resume(selected_profile):
         st.success(f"resume uploaded: {upload_info.get('filename', 'resume.docx')}")
+        with st.expander('Read uploaded resume template before generate', expanded=False):
+            _render_uploaded_resume_template_preview(selected_profile, storage.get_app_settings(), 'profile_settings_template_preview')
     else:
         st.warning('no resume so must upload resume')
 
@@ -1606,11 +1945,11 @@ def app_settings_page(user: dict) -> None:
     with st.form('app_settings_form'):
         default_prompt = st.text_area('Default prompt', value=settings.get('default_prompt', ''), height=220, placeholder='Default resume guidance that should apply to every generation...')
         download_output_dir = st.text_input('Server save folder (local desktop mode only)', value=settings.get('download_output_dir', 'saved_resumes'), help='Temporary DOCX/PDF files are created server-side before browser download.')
-        pdf_backend_order = st.text_input('PDF backend order', value=settings.get('pdf_backend_order', ', '.join(default_backend_order())), help='Comma-separated. For Windows + WPS, configure wps_custom when docx2pdf/Word is unavailable.')
+        pdf_backend_order = st.text_input('PDF backend order', value=settings.get('pdf_backend_order', 'docx2pdf, word, libreoffice, wps_custom'), help='Comma-separated. For Windows + WPS, configure wps_custom when docx2pdf/Word is unavailable.')
         wps_pdf_command = st.text_input('WPS custom PDF command', value=settings.get('wps_pdf_command', ''), help='Optional. Example: "C:\\Path\\to\\wps_export.bat" "{input}" "{output}"')
         submitted = st.form_submit_button('Save app settings', type='primary')
     if submitted:
-        storage.save_app_settings({'default_prompt': default_prompt.strip(), 'always_clean_generation': True, 'download_output_dir': download_output_dir.strip() or 'saved_resumes', 'pdf_backend_order': pdf_backend_order.strip() or ', '.join(default_backend_order()), 'wps_pdf_command': wps_pdf_command.strip()})
+        storage.save_app_settings({'default_prompt': default_prompt.strip(), 'always_clean_generation': True, 'download_output_dir': download_output_dir.strip() or 'saved_resumes', 'pdf_backend_order': pdf_backend_order.strip() or 'docx2pdf, word, libreoffice, wps_custom', 'wps_pdf_command': wps_pdf_command.strip()})
         st.success('App settings saved.')
         st.rerun()
     with st.expander('Detected PDF export backends'):
@@ -1652,6 +1991,35 @@ def _assigned_profile_help_text(selected_profiles: list[dict], owner_map: dict[s
     if not taken:
         return 'Each profile can be assigned to only one user.'
     return 'Each profile can be assigned to only one user. Profiles already assigned to other users are hidden from this picker.'
+
+
+def _record_openai_usage(result: dict, kind: str) -> None:
+    """Record one OpenAI call for the current user when the result came from a real API call."""
+    mode = str((result or {}).get('mode', '')).strip().lower()
+    if not mode.startswith('openai'):
+        return
+    user_id = str(st.session_state.get('current_user_id', '') or '').strip()
+    if not user_id:
+        return
+    try:
+        storage.record_openai_call(user_id, kind=kind)
+    except Exception:
+        pass
+
+
+def _record_openai_usage_for_improve(result: dict) -> None:
+    """Record one OpenAI call per ATS-improve round that actually hit the API."""
+    user_id = str(st.session_state.get('current_user_id', '') or '').strip()
+    if not user_id:
+        return
+    history = (result or {}).get('history', []) or []
+    for entry in history:
+        round_mode = str((entry or {}).get('mode', '')).strip().lower()
+        if round_mode.startswith('openai'):
+            try:
+                storage.record_openai_call(user_id, kind='ats_improve_round')
+            except Exception:
+                pass
 
 
 def _safe_parse_datetime(value: str) -> datetime | None:
@@ -1722,7 +2090,51 @@ def _metrics_week_selector(rows: list[dict], key: str, label_visibility: str = '
     return week_options[selected_week_label]
 
 
-def _build_weekly_summary_rows(rows: list[dict], users: list[dict], selected_week_start: date) -> list[dict]:
+def _application_metrics_column_config(include_openai: bool = True) -> dict:
+    """Annotate each weekly metrics column with a hover description.
+
+    Admin view (``include_openai=True``) shows ``applications/openai_calls`` per
+    day. User view (``include_openai=False``) shows applications only — the
+    OpenAI call counts are admin-internal data.
+    """
+    if include_openai:
+        day_help = 'Applications saved that day / OpenAI API calls made that day for this user.'
+        sum_help = 'Weekly total: applications saved / OpenAI calls.'
+        day_column = lambda label: st.column_config.TextColumn(label, help=day_help)
+        sum_column = st.column_config.TextColumn('Sum', help=sum_help)
+    else:
+        day_help = 'Applications saved that day.'
+        sum_help = 'Weekly total of applications saved.'
+        day_column = lambda label: st.column_config.NumberColumn(label, help=day_help)
+        sum_column = st.column_config.NumberColumn('Sum', help=sum_help)
+    return {
+        'User': st.column_config.TextColumn('User', help='Approved user (full name or username).'),
+        'Mon': day_column('Mon'),
+        'Tue': day_column('Tue'),
+        'Wed': day_column('Wed'),
+        'Thu': day_column('Thu'),
+        'Fri': day_column('Fri'),
+        'Sat': day_column('Sat'),
+        'Sun': day_column('Sun'),
+        'Sum': sum_column,
+        'Schedules': st.column_config.NumberColumn('Schedules', help='Interview schedule submissions made this week.'),
+    }
+
+
+def _openai_call_index() -> dict[tuple[str, date], int]:
+    """Aggregate OpenAI call counts by (user_id, date)."""
+    index: dict[tuple[str, date], int] = {}
+    for entry in storage.get_openai_calls():
+        recorded_dt = _safe_parse_datetime(entry.get('recorded_at', ''))
+        user_id = str(entry.get('user_id', '') or '').strip()
+        if not recorded_dt or not user_id:
+            continue
+        key = (user_id, recorded_dt.date())
+        index[key] = index.get(key, 0) + 1
+    return index
+
+
+def _build_weekly_summary_rows(rows: list[dict], users: list[dict], selected_week_start: date, include_openai: bool = True) -> list[dict]:
     day_offsets = [
         ('Mon', 0),
         ('Tue', 1),
@@ -1754,17 +2166,26 @@ def _build_weekly_summary_rows(rows: list[dict], users: list[dict], selected_wee
                 total += 1
         return total
 
+    openai_index = _openai_call_index() if include_openai else {}
+
     summary_rows: list[dict] = []
     for member in users:
         uid = str(member.get('id', ''))
         member_name = member.get('full_name') or member.get('username') or 'Unknown'
         row = {'User': member_name}
-        week_total = 0
+        week_app_total = 0
+        week_openai_total = 0
         for label, offset in day_offsets:
-            count = _day_count(uid, offset)
-            row[label] = count
-            week_total += count
-        row['Sum'] = week_total
+            day_date = selected_week_start + timedelta(days=offset)
+            apps = _day_count(uid, offset)
+            if include_openai:
+                openai_count = int(openai_index.get((uid, day_date), 0))
+                row[label] = f'{apps}/{openai_count}'
+                week_openai_total += openai_count
+            else:
+                row[label] = apps
+            week_app_total += apps
+        row['Sum'] = f'{week_app_total}/{week_openai_total}' if include_openai else week_app_total
         row['Schedules'] = _schedule_count(uid)
         summary_rows.append(row)
     return sorted(summary_rows, key=lambda item: str(item.get('User', '')).lower())
@@ -1784,7 +2205,12 @@ def _render_application_metrics_tab() -> None:
         selected_week_start = _metrics_week_selector(rows, key='metrics_selected_week')
 
     summary_rows = _build_weekly_summary_rows(rows, users, selected_week_start)
-    st.dataframe(summary_rows, use_container_width=True, hide_index=True)
+    st.dataframe(
+        summary_rows,
+        use_container_width=True,
+        hide_index=True,
+        column_config=_application_metrics_column_config(),
+    )
 
 
 def _render_schedule_reviews_tab(admin_user: dict) -> None:
@@ -1840,9 +2266,14 @@ def my_weekly_result_page(user: dict) -> None:
     with week_col:
         selected_week_start = _metrics_week_selector(rows, key='my_weekly_result_week')
 
-    summary_rows = _build_weekly_summary_rows(rows, [user], selected_week_start)
+    summary_rows = _build_weekly_summary_rows(rows, [user], selected_week_start, include_openai=False)
     if summary_rows:
-        st.dataframe(summary_rows, use_container_width=True, hide_index=True)
+        st.dataframe(
+            summary_rows,
+            use_container_width=True,
+            hide_index=True,
+            column_config=_application_metrics_column_config(include_openai=False),
+        )
     else:
         st.info('No saved applications for the selected week yet.')
 
@@ -2058,7 +2489,7 @@ def job_list_page(user: dict) -> None:
     if notice:
         st.success(notice)
 
-    tabs = ['Approved jobs', 'Add job'] + (['Batch presave', 'Pending admin queue'] if is_admin(user) else [])
+    tabs = ['Approved jobs', 'Add job'] + (['Batch presave', 'Pending admin queue', 'Reported jobs'] if is_admin(user) else [])
     rendered_tabs = st.tabs(tabs)
 
     with rendered_tabs[0]:
@@ -2101,6 +2532,59 @@ def job_list_page(user: dict) -> None:
                 with action_col:
                     if st.button('Use in Dashboard', key=f"use_job_{job.get('id')}", use_container_width=True):
                         _load_job_into_dashboard(job)
+                        st.rerun()
+                    if is_admin(user):
+                        edit_key = f'edit_job_open_{job.get("id")}'
+                        confirm_key = f'delete_job_confirm_{job.get("id")}'
+                        if st.button('Edit', key=f"edit_job_{job.get('id')}", use_container_width=True):
+                            st.session_state[edit_key] = not st.session_state.get(edit_key, False)
+                        if st.session_state.get(confirm_key, False):
+                            d_yes, d_no = st.columns(2)
+                            with d_yes:
+                                if st.button('Confirm', key=f"delete_job_yes_{job.get('id')}", type='primary', use_container_width=True):
+                                    storage.delete_job(job.get('id', ''))
+                                    st.session_state.pop(confirm_key, None)
+                                    st.session_state.pop(edit_key, None)
+                                    st.session_state['job_list_notice'] = 'Job deleted.'
+                                    st.rerun()
+                            with d_no:
+                                if st.button('Cancel', key=f"delete_job_no_{job.get('id')}", use_container_width=True):
+                                    st.session_state.pop(confirm_key, None)
+                                    st.rerun()
+                        else:
+                            if st.button('Delete', key=f"delete_job_{job.get('id')}", use_container_width=True):
+                                st.session_state[confirm_key] = True
+                                st.rerun()
+                if is_admin(user) and st.session_state.get(f'edit_job_open_{job.get("id")}', False):
+                    with st.form(key=f"approved_edit_form_{job.get('id')}"):
+                        ec_company = st.text_input('Company', value=job.get('company', ''), key=f"approved_edit_company_{job.get('id')}")
+                        ec_title = st.text_input('Job title', value=job.get('job_title', ''), key=f"approved_edit_title_{job.get('id')}")
+                        ec_link = st.text_input('Link', value=job.get('link', ''), key=f"approved_edit_link_{job.get('id')}")
+                        region_label = _region_label(job.get('region', 'US'))
+                        try:
+                            region_index = REGION_OPTIONS.index(region_label)
+                        except ValueError:
+                            region_index = REGION_OPTIONS.index('US') if 'US' in REGION_OPTIONS else 0
+                        ec_region = st.selectbox('Job market', REGION_OPTIONS, index=region_index, key=f"approved_edit_region_{job.get('id')}")
+                        ec_desc = st.text_area('Description', value=job.get('description', ''), height=240, key=f"approved_edit_desc_{job.get('id')}")
+                        ec_note = st.text_area('Note', value=job.get('note', ''), height=90, key=f"approved_edit_note_{job.get('id')}")
+                        ec_save, ec_cancel = st.columns(2)
+                        save_clicked = ec_save.form_submit_button('Save changes', type='primary', use_container_width=True)
+                        cancel_clicked = ec_cancel.form_submit_button('Close', use_container_width=True)
+                    if save_clicked:
+                        storage.update_job(job.get('id', ''), {
+                            'company': ec_company,
+                            'job_title': ec_title,
+                            'link': ec_link,
+                            'region': _normalize_region(ec_region),
+                            'description': ec_desc,
+                            'note': ec_note,
+                        })
+                        st.session_state[f'edit_job_open_{job.get("id")}'] = False
+                        st.session_state['job_list_notice'] = 'Job updated.'
+                        st.rerun()
+                    if cancel_clicked:
+                        st.session_state[f'edit_job_open_{job.get("id")}'] = False
                         st.rerun()
 
     with rendered_tabs[1]:
@@ -2244,6 +2728,60 @@ def job_list_page(user: dict) -> None:
                         st.session_state['job_list_notice'] = 'Pending job deleted.'
                         st.rerun()
 
+        with rendered_tabs[4]:
+            reported_jobs = [
+                job for job in storage.get_jobs(include_pending=True)
+                if ((job.get('reports') or []) or job.get('flagged'))
+                and not job.get('admin_applied', False)
+            ]
+            reported_jobs.sort(
+                key=lambda job: ((job.get('reports') or [{}])[-1].get('reported_at', '')),
+                reverse=True,
+            )
+            if not reported_jobs:
+                st.info('No reported jobs yet.')
+            else:
+                st.caption(f'{len(reported_jobs)} reported job(s). Reports are flagged by users or auto-flagged after repeated low ATS scores.')
+            for job in reported_jobs:
+                reports = job.get('reports', []) or []
+                with st.expander(f"Reported • {_job_summary_label(job)} • {len(reports)} report(s)"):
+                    if job.get('link'):
+                        st.caption(job.get('link', ''))
+                    meta_bits = [f"Status: {job.get('status', 'unknown')}", f"Market: {_region_label(job.get('region', ''))}"]
+                    if job.get('created_by_username'):
+                        meta_bits.append(f"Added by {job.get('created_by_username', '')}")
+                    st.caption(' • '.join(meta_bits))
+                    if not reports:
+                        st.warning('Job is flagged but has no report entries.')
+                    for index, report in enumerate(reports):
+                        source = str(report.get('source', 'user') or 'user').strip()
+                        reporter = report.get('reported_by_username') or ('system' if source == 'system' else 'unknown')
+                        reported_at = report.get('reported_at', '') or 'unknown time'
+                        st.markdown(f"**{index + 1}. {reporter}** ({source}) — `{reported_at}`")
+                        st.write(report.get('reason', ''))
+                    action1, action2, action3 = st.columns(3)
+                    with action1:
+                        if st.button('Dismiss reports & restore', key=f'dismiss_reports_{job.get("id")}', use_container_width=True):
+                            storage.clear_job_reports(job.get('id', ''))
+                            st.session_state['job_list_notice'] = 'Reports cleared and job restored to the active list.'
+                            st.rerun()
+                    with action2:
+                        if st.button('Delete job', key=f'delete_reported_{job.get("id")}', use_container_width=True):
+                            storage.delete_job(job.get('id', ''))
+                            st.session_state['job_list_notice'] = 'Reported job deleted.'
+                            st.rerun()
+                    with action3:
+                        if st.button('Mark as applied by admin', key=f'admin_applied_{job.get("id")}', use_container_width=True):
+                            storage.update_job(job.get('id', ''), {
+                                'admin_applied': True,
+                                'admin_applied_at': datetime.utcnow().isoformat() + 'Z',
+                                'admin_applied_by_user_id': user.get('id', ''),
+                                'admin_applied_by_username': user.get('username', ''),
+                                'flagged': False,
+                            })
+                            st.session_state['job_list_notice'] = 'Job marked as applied by admin and removed from active queue.'
+                            st.rerun()
+
 
 # ---------- Generated resumes ----------
 
@@ -2279,8 +2817,8 @@ def _generated_resume_search_blob(item: dict, profile_name: str) -> str:
     return ' '.join(str(part) for part in parts if part).lower()
 
 
-def _render_generated_resume_download_tab(item: dict, resume_snapshot: dict, item_key: str) -> None:
-    profile = storage.get_profile_by_id(item.get('profile_id', '')) or {
+def _resolve_generated_resume_profile(item: dict) -> dict:
+    return storage.get_profile_by_id(item.get('profile_id', '')) or {
         'name': item.get('resume', {}).get('name', '') or item.get('created_by_username', 'Candidate'),
         'email': '',
         'phone': '',
@@ -2289,23 +2827,94 @@ def _render_generated_resume_download_tab(item: dict, resume_snapshot: dict, ite
         'github': '',
         'uploaded_resume': {},
     }
+
+
+def _resolve_saved_resume_pdf_path(item: dict) -> Path | None:
+    raw = str(item.get('saved_pdf_path', '') or '').strip()
+    if raw:
+        candidate = Path(raw).expanduser()
+        if not candidate.is_absolute():
+            candidate = APP_DIR / 'data' / candidate
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    saved_id = str(item.get('saved_resume_id', '') or '').strip()
+    if saved_id:
+        candidate = _saved_resume_pdf_path_for(saved_id)
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return None
+
+
+def _generated_resume_pdf_exports(item: dict, resume_snapshot: dict, item_key: str) -> tuple[dict | None, str]:
+    """Return cached exports when no original PDF was saved for this resume."""
+    cache = st.session_state.setdefault('generated_resume_export_cache', {})
+    cache_key = item.get('saved_resume_id', '') or item_key
+    if cache_key in cache:
+        return cache[cache_key]
+    profile = _resolve_generated_resume_profile(item)
+    try:
+        exports = _build_uploaded_docx_pdf_exports(
+            resume=resume_snapshot,
+            profile=profile,
+            app_settings=storage.get_app_settings(),
+        )
+        result: tuple[dict | None, str] = (exports, '')
+    except Exception as exc:
+        result = (None, str(exc))
+    cache[cache_key] = result
+    return result
+
+
+def _render_generated_resume_download_tab(item: dict, resume_snapshot: dict, item_key: str) -> None:
+    profile = _resolve_generated_resume_profile(item)
     filename = item.get('download_filename') or item.get('saved_files', {}).get('pdf') or f"{_build_file_stem(profile)}.pdf"
     st.write(f"Download filename: {filename}")
-    try:
-        exports = _build_uploaded_docx_pdf_exports(resume=resume_snapshot, profile=profile, app_settings=storage.get_app_settings())
-    except Exception as exc:
-        st.error(str(exc))
+
+    saved_pdf_path = _resolve_saved_resume_pdf_path(item)
+    if saved_pdf_path is not None:
+        try:
+            pdf_bytes = saved_pdf_path.read_bytes()
+        except OSError as exc:
+            st.error(f'Could not read the original PDF: {exc}')
+            return
+        st.download_button(
+            'Download Resume PDF',
+            data=pdf_bytes,
+            file_name=filename,
+            mime='application/pdf',
+            use_container_width=True,
+            disabled=not bool(pdf_bytes),
+            key=f'generated_resume_download_{item_key}',
+        )
+        st.caption('Serving the exact PDF generated when this resume was saved.')
         return
+
+    st.warning('Original PDF was not saved for this resume. You can rebuild it from the snapshot below.')
+    build_key = f'generated_resume_build_pdf_{item_key}'
+    cache = st.session_state.get('generated_resume_export_cache') or {}
+    cache_key = item.get('saved_resume_id', '') or item_key
+    if not st.session_state.get(build_key) and cache_key not in cache:
+        if st.button('Rebuild PDF from snapshot', key=f'generated_resume_build_button_{item_key}', use_container_width=True):
+            st.session_state[build_key] = True
+            st.rerun()
+        st.caption('Rebuilds may differ from the original because the uploaded DOCX template or skills may have changed.')
+        return
+    with st.spinner('Rebuilding PDF from saved snapshot...'):
+        exports, error = _generated_resume_pdf_exports(item, resume_snapshot, item_key)
+    if error:
+        st.error(error)
+        return
+    pdf_bytes = (exports or {}).get('pdf', b'')
     st.download_button(
         'Download Resume PDF',
-        data=exports.get('pdf', b''),
+        data=pdf_bytes,
         file_name=filename,
         mime='application/pdf',
         use_container_width=True,
-        disabled=not bool(exports.get('pdf')),
+        disabled=not bool(pdf_bytes),
         key=f'generated_resume_download_{item_key}',
     )
-    st.caption('The PDF is regenerated from the saved resume snapshot and the uploaded profile DOCX style.')
+    st.caption('Rebuilt from the saved resume snapshot.')
 
 def _render_interview_schedule_tab(item: dict, item_key: str, user: dict) -> None:
     schedule = item.get('interview_schedule', {}) if isinstance(item.get('interview_schedule', {}), dict) else {}
@@ -2450,12 +3059,15 @@ def generated_resumes_page(user: dict) -> None:
         return
 
     use_ai = st.toggle('Use OpenAI for application answers', value=True, key='generated_resume_use_ai')
+    open_items = st.session_state.setdefault('generated_resume_open_items', set())
+    if not isinstance(open_items, set):
+        open_items = set(open_items or [])
+        st.session_state['generated_resume_open_items'] = open_items
+
     for index, item in enumerate(reversed(filtered_items), start=1):
         created_at = item.get('created_at', '')
-        item_key = f"{index}_{created_at}_{item.get('saved_resume_id', '')}"
-        resume_snapshot = item.get('resume', {}) or {}
-        job_description = item.get('job_description', '') or ''
-        target_role = item.get('target_role', '') or ''
+        saved_id = item.get('saved_resume_id', '')
+        item_key = f"{index}_{created_at}_{saved_id}"
         profile_name = str((profiles_map.get(item.get('profile_id')) or {}).get('name', '')).strip() or 'Unknown profile'
         title = _generated_resume_display_title(item)
         with st.expander(title):
@@ -2473,10 +3085,30 @@ def generated_resumes_page(user: dict) -> None:
                 st.caption('Created by')
                 st.write(item.get('created_by_username', 'n/a'))
 
-            tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(['Snapshot', 'ATS Score', 'Job Application Answers', 'Job Description', 'Interview Schedule', 'Download Resume'])
-            with tab1:
+            is_open = saved_id in open_items
+            toggle_label = 'Hide details' if is_open else 'Open details'
+            if st.button(toggle_label, key=f'generated_resume_toggle_{item_key}', use_container_width=True):
+                if is_open:
+                    open_items.discard(saved_id)
+                else:
+                    open_items.add(saved_id)
+                st.rerun()
+            if not is_open:
+                st.caption('Click Open details to load the snapshot, ATS score, job description, schedule, and PDF download for this resume.')
+                continue
+
+            resume_snapshot = item.get('resume', {}) or {}
+            job_description = item.get('job_description', '') or ''
+            target_role = item.get('target_role', '') or ''
+
+            saved_tab_labels = ['Snapshot', 'ATS Score']
+            if is_admin(user):
+                saved_tab_labels.append('Job Application Answers')
+            saved_tab_labels.extend(['Job Description', 'Interview Schedule', 'Download Resume'])
+            saved_tabs = dict(zip(saved_tab_labels, st.tabs(saved_tab_labels)))
+            with saved_tabs['Snapshot']:
                 st.write(f"Created: {created_at or 'n/a'}")
-                st.write(f"Resume ID: {item.get('saved_resume_id', 'n/a')}")
+                st.write(f"Resume ID: {saved_id or 'n/a'}")
                 st.write("Style source: Uploaded DOCX")
                 st.write(f"Company message status: {item.get('company_message_status', 'n/a')}")
                 if item.get('job_link'):
@@ -2493,22 +3125,26 @@ def generated_resumes_page(user: dict) -> None:
                         _update_saved_resume_message(item, company_message_value)
                         st.success('Company message saved.')
                         st.rerun()
-            with tab2:
-                analysis = analyze_ats_score(resume_snapshot, job_description, target_role=target_role)
-                _render_ats_analysis(analysis)
-            with tab3:
-                _render_application_answers_tab(
-                    resume_snapshot=resume_snapshot,
-                    job_description=job_description,
-                    target_role=target_role,
-                    use_ai=use_ai,
-                    cache_prefix=f'generated_resume_answers_{item_key}',
-                )
-            with tab4:
+            with saved_tabs['ATS Score']:
+                ats_cache = st.session_state.setdefault('generated_resume_ats_cache', {})
+                ats_key = saved_id or item_key
+                if ats_key not in ats_cache:
+                    ats_cache[ats_key] = analyze_ats_score(resume_snapshot, job_description, target_role=target_role)
+                _render_ats_analysis(ats_cache[ats_key])
+            if 'Job Application Answers' in saved_tabs:
+                with saved_tabs['Job Application Answers']:
+                    _render_application_answers_tab(
+                        resume_snapshot=resume_snapshot,
+                        job_description=job_description,
+                        target_role=target_role,
+                        use_ai=use_ai,
+                        cache_prefix=f'generated_resume_answers_{item_key}',
+                    )
+            with saved_tabs['Job Description']:
                 st.text_area('Job description', value=job_description, height=320, key=f"job_description_snapshot_{item_key}")
-            with tab5:
+            with saved_tabs['Interview Schedule']:
                 _render_interview_schedule_tab(item, item_key, user)
-            with tab6:
+            with saved_tabs['Download Resume']:
                 _render_generated_resume_download_tab(item, resume_snapshot, item_key)
 
 
@@ -2588,12 +3224,20 @@ def _dashboard_ats_notes_tab(profile: dict, template: dict, resume: dict, job_de
             return
         with st.spinner('Improving the current draft against ATS guidance...'):
             result = improve_resume_to_target_ats(profile=profile, job_description=job_description, current_resume=current_resume, target_score=int(target_score), max_rounds=int(max_rounds), additional_requirements=st.session_state.get('dashboard_ats_improve_prompt', ''), target_role=target_role, custom_prompt=custom_prompt, default_prompt=default_prompt, use_ai=use_ai, clean_generation=clean_generation)
+            _record_openai_usage_for_improve(result)
         updated_resume = result.get('resume', current_resume)
         exports = _build_uploaded_docx_pdf_exports(resume=updated_resume, profile=profile, app_settings=storage.get_app_settings())
         st.session_state['last_resume'] = updated_resume
         st.session_state['last_exports'] = exports
         st.session_state['last_generator_mode'] = result.get('mode', 'ats-improve')
         st.session_state['last_ats_improve_history'] = result.get('history', [])
+        improved_ats = analyze_ats_score(updated_resume, job_description, target_role=target_role)
+        improved_score = int((improved_ats or {}).get('overall_score', 0))
+        improved_job_id = str(st.session_state.get('last_job_id', '') or '').strip()
+        active_user = storage.get_user_by_id(st.session_state.get('current_user_id', '')) or {}
+        if improved_job_id and _enforce_low_ats_rate_limit(active_user, improved_job_id, improved_score):
+            st.rerun()
+            return
         _queue_editor_reload(updated_resume, 'ATS-guided improvement applied to the current draft.')
         st.rerun()
     history = st.session_state.get('last_ats_improve_history', [])

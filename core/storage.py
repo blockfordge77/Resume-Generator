@@ -47,6 +47,7 @@ class Storage:
         self.settings_path = self.data_dir / 'settings.json'
         self.users_path = self.data_dir / 'users.json'
         self.jobs_path = self.data_dir / 'jobs.json'
+        self.openai_calls_path = self.data_dir / 'openai_calls.json'
         self._lock = threading.RLock()
         self._ensure_defaults()
 
@@ -87,6 +88,9 @@ class Storage:
 
             jobs = self._normalize_jobs(self._read_json(self.jobs_path)) if self.jobs_path.exists() else []
             self._write_json(self.jobs_path, jobs)
+
+            if not self.openai_calls_path.exists():
+                self._write_json(self.openai_calls_path, [])
 
     def _read_json(self, path: Path) -> Any:
         if not path.exists():
@@ -482,6 +486,38 @@ class Storage:
     def complete_job_scrape(self, job_id: str, patch: dict) -> None:
         self.update_job(job_id, patch)
 
+    def record_openai_call(self, user_id: str, kind: str = '') -> None:
+        cleaned_user = str(user_id or '').strip()
+        if not cleaned_user:
+            return
+        entry = {
+            'user_id': cleaned_user,
+            'kind': str(kind or '').strip(),
+            'recorded_at': datetime.utcnow().isoformat() + 'Z',
+        }
+        with self._lock:
+            items = self._read_json(self.openai_calls_path) or []
+            if not isinstance(items, list):
+                items = []
+            items.append(entry)
+            self._write_json(self.openai_calls_path, items)
+
+    def get_openai_calls(self) -> list[dict]:
+        with self._lock:
+            items = self._read_json(self.openai_calls_path) or []
+        if not isinstance(items, list):
+            return []
+        normalized: list[dict] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            normalized.append({
+                'user_id': str(item.get('user_id', '')).strip(),
+                'kind': str(item.get('kind', '')).strip(),
+                'recorded_at': str(item.get('recorded_at', '')).strip(),
+            })
+        return normalized
+
     def _parse_iso_datetime(self, value: str) -> datetime | None:
         raw = str(value or '').strip()
         if not raw:
@@ -604,24 +640,43 @@ class Storage:
         normalized: list[dict] = []
         for item in items or []:
             resume = item.get('resume', {}) if isinstance(item.get('resume', {}), dict) else {}
-            grouped_skills = resume.get('grouped_skills', {}) if isinstance(resume.get('grouped_skills', {}), dict) else {}
+            normalized_groups: list[dict] = []
+            raw_groups = resume.get('skill_groups')
+            if isinstance(raw_groups, list):
+                for group in raw_groups:
+                    if not isinstance(group, dict):
+                        continue
+                    category = str(group.get('category', '')).strip() or 'Other Relevant'
+                    items_clean = [str(v).strip() for v in group.get('items', []) or [] if str(v).strip()]
+                    if items_clean:
+                        normalized_groups.append({'category': category, 'items': items_clean})
+            elif isinstance(raw_groups, dict):
+                for key, values in raw_groups.items():
+                    items_clean = [str(v).strip() for v in values or [] if str(v).strip()]
+                    if items_clean:
+                        normalized_groups.append({'category': str(key).strip() or 'Other Relevant', 'items': items_clean})
+            if not normalized_groups:
+                legacy_grouped = resume.get('grouped_skills')
+                if isinstance(legacy_grouped, dict):
+                    for key, values in legacy_grouped.items():
+                        items_clean = [str(v).strip() for v in values or [] if str(v).strip()]
+                        if items_clean:
+                            normalized_groups.append({'category': str(key).strip() or 'Other Relevant', 'items': items_clean})
             normalized_resume = {
                 'name': str(resume.get('name', '')).strip(),
                 'headline': str(resume.get('headline', '')).strip(),
                 'summary': str(resume.get('summary', '')).strip(),
                 'fit_keywords': [str(v).strip() for v in resume.get('fit_keywords', []) if str(v).strip()],
                 'technical_skills': [str(v).strip() for v in resume.get('technical_skills', []) if str(v).strip()],
-                'grouped_skills': {
-                    str(key).strip() or 'Other Relevant': [str(v).strip() for v in values or [] if str(v).strip()]
-                    for key, values in grouped_skills.items()
-                    if [str(v).strip() for v in values or [] if str(v).strip()]
-                },
+                'skill_groups': normalized_groups,
+                'bold_keywords': [str(v).strip() for v in resume.get('bold_keywords', []) if str(v).strip()],
+                'auto_bold_fit_keywords': bool(resume.get('auto_bold_fit_keywords', False)),
                 'work_history': [
                     {
                         'company_name': str(work.get('company_name', '')).strip(),
                         'duration': str(work.get('duration', '')).strip(),
                         'location': str(work.get('location', '')).strip(),
-                        'role': str(work.get('role', '')).strip(),
+                        'role_title': str(work.get('role_title', work.get('role', ''))).strip(),
                         'role_headline': str(work.get('role_headline', '')).strip(),
                         'bullets': [str(v).strip() for v in work.get('bullets', []) if str(v).strip()],
                     }
@@ -659,6 +714,7 @@ class Storage:
                 'ats_score': int(item.get('ats_score', 0) or 0),
                 'download_filename': str(item.get('download_filename', '')).strip() or 'resume.pdf',
                 'download_mode': str(item.get('download_mode', 'browser') or 'browser').strip(),
+                'saved_pdf_path': str(item.get('saved_pdf_path', '')).strip(),
                 'company_message': str(item.get('company_message', '')).strip(),
                 'company_message_status': str(item.get('company_message_status', 'pending') or 'pending').strip(),
                 'company_message_updated_at': str(item.get('company_message_updated_at', '')).strip(),
@@ -733,8 +789,51 @@ class Storage:
                 'approved_by_username': str(item.get('approved_by_username', '')).strip(),
                 'scrape_started_at': str(item.get('scrape_started_at', '')).strip(),
                 'scraped_at': str(item.get('scraped_at', '')).strip(),
+                'reports': self._normalize_job_reports(item.get('reports', []) or []),
+                'flagged': bool(item.get('flagged', False)),
+                'admin_applied': bool(item.get('admin_applied', False)),
+                'admin_applied_at': str(item.get('admin_applied_at', '')).strip(),
+                'admin_applied_by_user_id': str(item.get('admin_applied_by_user_id', '')).strip(),
+                'admin_applied_by_username': str(item.get('admin_applied_by_username', '')).strip(),
             })
         return normalized
+
+    def _normalize_job_reports(self, items: Any) -> list[dict]:
+        normalized: list[dict] = []
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            reason = str(item.get('reason', '')).strip()
+            if not reason:
+                continue
+            normalized.append({
+                'reason': reason,
+                'reported_by_user_id': str(item.get('reported_by_user_id', '')).strip(),
+                'reported_by_username': str(item.get('reported_by_username', '')).strip(),
+                'reported_at': str(item.get('reported_at', '')).strip(),
+                'source': str(item.get('source', 'user') or 'user').strip(),
+            })
+        return normalized
+
+    def add_job_report(self, job_id: str, report: dict) -> None:
+        with self._lock:
+            items = self.get_jobs(include_pending=True)
+            for index, item in enumerate(items):
+                if item.get('id') == job_id:
+                    reports = list(item.get('reports', []) or [])
+                    reports.append(report)
+                    items[index] = self._normalize_jobs([item | {'reports': reports, 'flagged': True}])[0]
+                    self._write_json(self.jobs_path, items)
+                    return
+
+    def clear_job_reports(self, job_id: str) -> None:
+        with self._lock:
+            items = self.get_jobs(include_pending=True)
+            for index, item in enumerate(items):
+                if item.get('id') == job_id:
+                    items[index] = self._normalize_jobs([item | {'reports': [], 'flagged': False}])[0]
+                    self._write_json(self.jobs_path, items)
+                    return
 
 
 def _template_defaults() -> dict:
