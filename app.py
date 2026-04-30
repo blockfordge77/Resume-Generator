@@ -1100,15 +1100,32 @@ def _compact_resume_snapshot(resume: dict) -> dict:
         'summary': str(source.get('summary', '')).strip(),
         'fit_keywords': [str(item).strip() for item in source.get('fit_keywords', []) if str(item).strip()],
         'technical_skills': [str(item).strip() for item in source.get('technical_skills', []) if str(item).strip()],
-        'grouped_skills': {},
+        'skill_groups': [],
+        'bold_keywords': [str(item).strip() for item in source.get('bold_keywords', []) if str(item).strip()],
+        'auto_bold_fit_keywords': bool(source.get('auto_bold_fit_keywords', False)),
         'work_history': [],
         'education_history': [],
     }
-    grouped_skills = source.get('grouped_skills', {}) or {}
-    for key, values in grouped_skills.items():
-        cleaned_values = [str(item).strip() for item in values or [] if str(item).strip()]
-        if cleaned_values:
-            compact['grouped_skills'][str(key).strip() or 'Other Relevant'] = cleaned_values
+    raw_groups = source.get('skill_groups')
+    if isinstance(raw_groups, list):
+        for group in raw_groups:
+            if not isinstance(group, dict):
+                continue
+            category = str(group.get('category', '')).strip() or 'Other Relevant'
+            items = [str(v).strip() for v in group.get('items', []) or [] if str(v).strip()]
+            if items:
+                compact['skill_groups'].append({'category': category, 'items': items})
+    elif isinstance(raw_groups, dict):
+        for key, values in raw_groups.items():
+            items = [str(v).strip() for v in values or [] if str(v).strip()]
+            if items:
+                compact['skill_groups'].append({'category': str(key).strip() or 'Other Relevant', 'items': items})
+    legacy_grouped = source.get('grouped_skills')
+    if not compact['skill_groups'] and isinstance(legacy_grouped, dict):
+        for key, values in legacy_grouped.items():
+            items = [str(v).strip() for v in values or [] if str(v).strip()]
+            if items:
+                compact['skill_groups'].append({'category': str(key).strip() or 'Other Relevant', 'items': items})
     for item in source.get('work_history', []) or []:
         compact['work_history'].append({
             'company_name': str(item.get('company_name', '')).strip(),
@@ -1128,12 +1145,36 @@ def _compact_resume_snapshot(resume: dict) -> dict:
     return compact
 
 
+def _saved_resume_pdf_dir() -> Path:
+    folder = APP_DIR / 'data' / 'saved_resume_pdfs'
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def _saved_resume_pdf_path_for(saved_resume_id: str) -> Path:
+    return _saved_resume_pdf_dir() / f'{saved_resume_id}.pdf'
+
+
+def _persist_saved_resume_pdf(saved_resume_id: str, pdf_bytes: bytes) -> str:
+    if not saved_resume_id or not pdf_bytes:
+        return ''
+    target = _saved_resume_pdf_path_for(saved_resume_id)
+    target.write_bytes(pdf_bytes)
+    try:
+        return str(target.resolve().relative_to((APP_DIR / 'data').resolve()))
+    except Exception:
+        return str(target)
+
+
 def _saved_resume_payload(user: dict, profile: dict, template: dict, resume: dict, ats_analysis: dict, exports: dict, app_settings: dict) -> dict:
     saved_resume_id = storage.make_id('resume')
     created_at = datetime.utcnow().isoformat() + 'Z'
 
     file_stem = _build_file_stem(profile)
     pdf_name = f'{file_stem}.pdf'
+
+    pdf_bytes = (exports or {}).get('pdf') or b''
+    saved_pdf_path = _persist_saved_resume_pdf(saved_resume_id, pdf_bytes) if pdf_bytes else ''
 
     payload = {
         'saved_resume_id': saved_resume_id,
@@ -1156,6 +1197,7 @@ def _saved_resume_payload(user: dict, profile: dict, template: dict, resume: dic
         'download_mode': 'browser',
         'company_message': '',
         'company_message_status': 'pending',
+        'saved_pdf_path': saved_pdf_path,
     }
     return payload
 
@@ -2770,8 +2812,8 @@ def _generated_resume_search_blob(item: dict, profile_name: str) -> str:
     return ' '.join(str(part) for part in parts if part).lower()
 
 
-def _render_generated_resume_download_tab(item: dict, resume_snapshot: dict, item_key: str) -> None:
-    profile = storage.get_profile_by_id(item.get('profile_id', '')) or {
+def _resolve_generated_resume_profile(item: dict) -> dict:
+    return storage.get_profile_by_id(item.get('profile_id', '')) or {
         'name': item.get('resume', {}).get('name', '') or item.get('created_by_username', 'Candidate'),
         'email': '',
         'phone': '',
@@ -2780,23 +2822,94 @@ def _render_generated_resume_download_tab(item: dict, resume_snapshot: dict, ite
         'github': '',
         'uploaded_resume': {},
     }
+
+
+def _resolve_saved_resume_pdf_path(item: dict) -> Path | None:
+    raw = str(item.get('saved_pdf_path', '') or '').strip()
+    if raw:
+        candidate = Path(raw).expanduser()
+        if not candidate.is_absolute():
+            candidate = APP_DIR / 'data' / candidate
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    saved_id = str(item.get('saved_resume_id', '') or '').strip()
+    if saved_id:
+        candidate = _saved_resume_pdf_path_for(saved_id)
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return None
+
+
+def _generated_resume_pdf_exports(item: dict, resume_snapshot: dict, item_key: str) -> tuple[dict | None, str]:
+    """Return cached exports when no original PDF was saved for this resume."""
+    cache = st.session_state.setdefault('generated_resume_export_cache', {})
+    cache_key = item.get('saved_resume_id', '') or item_key
+    if cache_key in cache:
+        return cache[cache_key]
+    profile = _resolve_generated_resume_profile(item)
+    try:
+        exports = _build_uploaded_docx_pdf_exports(
+            resume=resume_snapshot,
+            profile=profile,
+            app_settings=storage.get_app_settings(),
+        )
+        result: tuple[dict | None, str] = (exports, '')
+    except Exception as exc:
+        result = (None, str(exc))
+    cache[cache_key] = result
+    return result
+
+
+def _render_generated_resume_download_tab(item: dict, resume_snapshot: dict, item_key: str) -> None:
+    profile = _resolve_generated_resume_profile(item)
     filename = item.get('download_filename') or item.get('saved_files', {}).get('pdf') or f"{_build_file_stem(profile)}.pdf"
     st.write(f"Download filename: {filename}")
-    try:
-        exports = _build_uploaded_docx_pdf_exports(resume=resume_snapshot, profile=profile, app_settings=storage.get_app_settings())
-    except Exception as exc:
-        st.error(str(exc))
+
+    saved_pdf_path = _resolve_saved_resume_pdf_path(item)
+    if saved_pdf_path is not None:
+        try:
+            pdf_bytes = saved_pdf_path.read_bytes()
+        except OSError as exc:
+            st.error(f'Could not read the original PDF: {exc}')
+            return
+        st.download_button(
+            'Download Resume PDF',
+            data=pdf_bytes,
+            file_name=filename,
+            mime='application/pdf',
+            use_container_width=True,
+            disabled=not bool(pdf_bytes),
+            key=f'generated_resume_download_{item_key}',
+        )
+        st.caption('Serving the exact PDF generated when this resume was saved.')
         return
+
+    st.warning('Original PDF was not saved for this resume. You can rebuild it from the snapshot below.')
+    build_key = f'generated_resume_build_pdf_{item_key}'
+    cache = st.session_state.get('generated_resume_export_cache') or {}
+    cache_key = item.get('saved_resume_id', '') or item_key
+    if not st.session_state.get(build_key) and cache_key not in cache:
+        if st.button('Rebuild PDF from snapshot', key=f'generated_resume_build_button_{item_key}', use_container_width=True):
+            st.session_state[build_key] = True
+            st.rerun()
+        st.caption('Rebuilds may differ from the original because the uploaded DOCX template or skills may have changed.')
+        return
+    with st.spinner('Rebuilding PDF from saved snapshot...'):
+        exports, error = _generated_resume_pdf_exports(item, resume_snapshot, item_key)
+    if error:
+        st.error(error)
+        return
+    pdf_bytes = (exports or {}).get('pdf', b'')
     st.download_button(
         'Download Resume PDF',
-        data=exports.get('pdf', b''),
+        data=pdf_bytes,
         file_name=filename,
         mime='application/pdf',
         use_container_width=True,
-        disabled=not bool(exports.get('pdf')),
+        disabled=not bool(pdf_bytes),
         key=f'generated_resume_download_{item_key}',
     )
-    st.caption('The PDF is regenerated from the saved resume snapshot and the uploaded profile DOCX style.')
+    st.caption('Rebuilt from the saved resume snapshot.')
 
 def _render_interview_schedule_tab(item: dict, item_key: str, user: dict) -> None:
     schedule = item.get('interview_schedule', {}) if isinstance(item.get('interview_schedule', {}), dict) else {}
@@ -2941,12 +3054,15 @@ def generated_resumes_page(user: dict) -> None:
         return
 
     use_ai = st.toggle('Use OpenAI for application answers', value=True, key='generated_resume_use_ai')
+    open_items = st.session_state.setdefault('generated_resume_open_items', set())
+    if not isinstance(open_items, set):
+        open_items = set(open_items or [])
+        st.session_state['generated_resume_open_items'] = open_items
+
     for index, item in enumerate(reversed(filtered_items), start=1):
         created_at = item.get('created_at', '')
-        item_key = f"{index}_{created_at}_{item.get('saved_resume_id', '')}"
-        resume_snapshot = item.get('resume', {}) or {}
-        job_description = item.get('job_description', '') or ''
-        target_role = item.get('target_role', '') or ''
+        saved_id = item.get('saved_resume_id', '')
+        item_key = f"{index}_{created_at}_{saved_id}"
         profile_name = str((profiles_map.get(item.get('profile_id')) or {}).get('name', '')).strip() or 'Unknown profile'
         title = _generated_resume_display_title(item)
         with st.expander(title):
@@ -2964,6 +3080,22 @@ def generated_resumes_page(user: dict) -> None:
                 st.caption('Created by')
                 st.write(item.get('created_by_username', 'n/a'))
 
+            is_open = saved_id in open_items
+            toggle_label = 'Hide details' if is_open else 'Open details'
+            if st.button(toggle_label, key=f'generated_resume_toggle_{item_key}', use_container_width=True):
+                if is_open:
+                    open_items.discard(saved_id)
+                else:
+                    open_items.add(saved_id)
+                st.rerun()
+            if not is_open:
+                st.caption('Click Open details to load the snapshot, ATS score, job description, schedule, and PDF download for this resume.')
+                continue
+
+            resume_snapshot = item.get('resume', {}) or {}
+            job_description = item.get('job_description', '') or ''
+            target_role = item.get('target_role', '') or ''
+
             saved_tab_labels = ['Snapshot', 'ATS Score']
             if is_admin(user):
                 saved_tab_labels.append('Job Application Answers')
@@ -2971,7 +3103,7 @@ def generated_resumes_page(user: dict) -> None:
             saved_tabs = dict(zip(saved_tab_labels, st.tabs(saved_tab_labels)))
             with saved_tabs['Snapshot']:
                 st.write(f"Created: {created_at or 'n/a'}")
-                st.write(f"Resume ID: {item.get('saved_resume_id', 'n/a')}")
+                st.write(f"Resume ID: {saved_id or 'n/a'}")
                 st.write("Style source: Uploaded DOCX")
                 st.write(f"Company message status: {item.get('company_message_status', 'n/a')}")
                 if item.get('job_link'):
@@ -2989,8 +3121,11 @@ def generated_resumes_page(user: dict) -> None:
                         st.success('Company message saved.')
                         st.rerun()
             with saved_tabs['ATS Score']:
-                analysis = analyze_ats_score(resume_snapshot, job_description, target_role=target_role)
-                _render_ats_analysis(analysis)
+                ats_cache = st.session_state.setdefault('generated_resume_ats_cache', {})
+                ats_key = saved_id or item_key
+                if ats_key not in ats_cache:
+                    ats_cache[ats_key] = analyze_ats_score(resume_snapshot, job_description, target_role=target_role)
+                _render_ats_analysis(ats_cache[ats_key])
             if 'Job Application Answers' in saved_tabs:
                 with saved_tabs['Job Application Answers']:
                     _render_application_answers_tab(

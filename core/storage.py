@@ -640,24 +640,43 @@ class Storage:
         normalized: list[dict] = []
         for item in items or []:
             resume = item.get('resume', {}) if isinstance(item.get('resume', {}), dict) else {}
-            grouped_skills = resume.get('grouped_skills', {}) if isinstance(resume.get('grouped_skills', {}), dict) else {}
+            normalized_groups: list[dict] = []
+            raw_groups = resume.get('skill_groups')
+            if isinstance(raw_groups, list):
+                for group in raw_groups:
+                    if not isinstance(group, dict):
+                        continue
+                    category = str(group.get('category', '')).strip() or 'Other Relevant'
+                    items_clean = [str(v).strip() for v in group.get('items', []) or [] if str(v).strip()]
+                    if items_clean:
+                        normalized_groups.append({'category': category, 'items': items_clean})
+            elif isinstance(raw_groups, dict):
+                for key, values in raw_groups.items():
+                    items_clean = [str(v).strip() for v in values or [] if str(v).strip()]
+                    if items_clean:
+                        normalized_groups.append({'category': str(key).strip() or 'Other Relevant', 'items': items_clean})
+            if not normalized_groups:
+                legacy_grouped = resume.get('grouped_skills')
+                if isinstance(legacy_grouped, dict):
+                    for key, values in legacy_grouped.items():
+                        items_clean = [str(v).strip() for v in values or [] if str(v).strip()]
+                        if items_clean:
+                            normalized_groups.append({'category': str(key).strip() or 'Other Relevant', 'items': items_clean})
             normalized_resume = {
                 'name': str(resume.get('name', '')).strip(),
                 'headline': str(resume.get('headline', '')).strip(),
                 'summary': str(resume.get('summary', '')).strip(),
                 'fit_keywords': [str(v).strip() for v in resume.get('fit_keywords', []) if str(v).strip()],
                 'technical_skills': [str(v).strip() for v in resume.get('technical_skills', []) if str(v).strip()],
-                'grouped_skills': {
-                    str(key).strip() or 'Other Relevant': [str(v).strip() for v in values or [] if str(v).strip()]
-                    for key, values in grouped_skills.items()
-                    if [str(v).strip() for v in values or [] if str(v).strip()]
-                },
+                'skill_groups': normalized_groups,
+                'bold_keywords': [str(v).strip() for v in resume.get('bold_keywords', []) if str(v).strip()],
+                'auto_bold_fit_keywords': bool(resume.get('auto_bold_fit_keywords', False)),
                 'work_history': [
                     {
                         'company_name': str(work.get('company_name', '')).strip(),
                         'duration': str(work.get('duration', '')).strip(),
                         'location': str(work.get('location', '')).strip(),
-                        'role': str(work.get('role', '')).strip(),
+                        'role_title': str(work.get('role_title', work.get('role', ''))).strip(),
                         'role_headline': str(work.get('role_headline', '')).strip(),
                         'bullets': [str(v).strip() for v in work.get('bullets', []) if str(v).strip()],
                     }
@@ -695,6 +714,7 @@ class Storage:
                 'ats_score': int(item.get('ats_score', 0) or 0),
                 'download_filename': str(item.get('download_filename', '')).strip() or 'resume.pdf',
                 'download_mode': str(item.get('download_mode', 'browser') or 'browser').strip(),
+                'saved_pdf_path': str(item.get('saved_pdf_path', '')).strip(),
                 'company_message': str(item.get('company_message', '')).strip(),
                 'company_message_status': str(item.get('company_message_status', 'pending') or 'pending').strip(),
                 'company_message_updated_at': str(item.get('company_message_updated_at', '')).strip(),
