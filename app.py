@@ -1387,6 +1387,25 @@ def _enforce_low_ats_rate_limit(user: dict, job_id: str, ats_score: int) -> bool
     return True
 
 
+def _report_openai_fallback_to_admin(user: dict, job_id: str, result: dict) -> None:
+    """Flag the job for admin review when OpenAI generation was requested but fell back to demo."""
+    job_id = str(job_id or '').strip()
+    if not job_id:
+        return
+    mode = str((result or {}).get('mode', '')).strip().lower()
+    if mode != 'demo-fallback':
+        return
+    note = str(((result or {}).get('resume') or {}).get('generation_note', '') or '').strip()
+    detail = note or 'OpenAI generation failed; system fell back to demo mode.'
+    storage.add_job_report(job_id, {
+        'reason': f'Auto-flagged: OpenAI resume generation failed and fell back to demo mode. Detail: {detail}',
+        'reported_by_user_id': (user or {}).get('id', ''),
+        'reported_by_username': (user or {}).get('username', ''),
+        'reported_at': datetime.utcnow().isoformat() + 'Z',
+        'source': 'system',
+    })
+
+
 def _advance_to_next_dashboard_job(current_job_id: str) -> None:
     user_id = st.session_state.get('current_user_id', '')
     user_record = storage.get_user_by_id(user_id) if user_id else None
@@ -1607,53 +1626,83 @@ def dashboard_page(user: dict) -> None:
         job_description = st.text_area('Job description', value=st.session_state.get('last_job_description', ''), height=330, placeholder='Paste the full job description here...')
         custom_prompt = st.text_area('Custom resume prompt (optional)', value=st.session_state.get('last_custom_prompt', ''), height=110, placeholder='Example: Keep the resume sharply aligned to backend ownership, emphasize exact named tech stacks in each company bullet, and avoid generic wording.')
 
-        create_clicked = st.button('Create tailored resume', type='primary', use_container_width=True)
+        is_generating_resume = bool(st.session_state.get('dashboard_is_generating_resume', False))
+        create_clicked = st.button(
+            'Create tailored resume',
+            type='primary',
+            use_container_width=True,
+            disabled=is_generating_resume,
+            key='dashboard_create_tailored_resume_button',
+        )
 
-        if create_clicked:
+        if create_clicked and not is_generating_resume:
             if not job_description.strip():
                 st.error('Please paste a job description first.')
                 return
             if not _profile_has_uploaded_resume(profile):
                 st.error('no resume so must upload resume')
                 return
-            with st.spinner('Generating resume content and export files...'):
-                result = generate_resume_content(
-                    profile=profile,
-                    job_description=job_description,
-                    target_role=target_role,
-                    custom_prompt=custom_prompt,
-                    default_prompt=default_prompt,
-                    use_ai=use_ai,
-                    clean_generation=clean_generation,
-                )
-                _record_openai_usage(result, 'generate_resume')
-                resume = result['resume']
-                resume['bold_keywords'] = []
-                resume['auto_bold_fit_keywords'] = False
-                exports = _build_uploaded_docx_pdf_exports(resume=resume, profile=profile, app_settings=app_settings)
-                ats_after_generate = analyze_ats_score(resume, job_description, target_role=target_role)
-            ats_score_now = int((ats_after_generate or {}).get('overall_score', 0))
-            generated_job_id = str(selected_job.get('id', '') or '').strip()
-            if generated_job_id and _enforce_low_ats_rate_limit(user, generated_job_id, ats_score_now):
-                st.rerun()
-                return
-            st.session_state['last_resume'] = resume
-            st.session_state['last_exports'] = exports
-            st.session_state['last_template_id'] = 'uploaded_docx_style'
-            st.session_state['last_profile_id'] = profile.get('id')
-            st.session_state['last_job_link'] = st.session_state.get('last_job_link', '')
-            st.session_state['last_job_description'] = job_description
-            st.session_state['last_target_role'] = target_role
-            st.session_state['last_job_region'] = current_job_region
-            st.session_state['last_custom_prompt'] = custom_prompt
-            st.session_state['last_bold_keywords'] = ''
-            st.session_state['last_auto_bold_fit_keywords'] = False
-            st.session_state['last_update_prompt'] = ''
-            st.session_state['last_generator_mode'] = result['mode']
-            if selected_job.get('id'):
-                st.session_state['last_job_id'] = selected_job.get('id', '')
-                st.session_state['last_job_company'] = selected_job.get('company', '')
-            _queue_editor_reload(resume, f"Resume generated in {result['mode']} mode.")
+            st.session_state['dashboard_is_generating_resume'] = True
+            st.session_state['dashboard_pending_generation'] = {
+                'profile_id': profile.get('id'),
+                'job_description': job_description,
+                'target_role': target_role,
+                'custom_prompt': custom_prompt,
+                'use_ai': bool(use_ai),
+                'current_job_region': current_job_region,
+                'selected_job_id': selected_job.get('id', ''),
+                'selected_job_company': selected_job.get('company', ''),
+            }
+            st.rerun()
+
+        if is_generating_resume:
+            inputs = st.session_state.get('dashboard_pending_generation') or {}
+            gen_profile = storage.get_profile_by_id(inputs.get('profile_id', '')) or profile
+            try:
+                with st.spinner('Generating resume content and export files...'):
+                    result = generate_resume_content(
+                        profile=gen_profile,
+                        job_description=inputs.get('job_description', ''),
+                        target_role=inputs.get('target_role', ''),
+                        custom_prompt=inputs.get('custom_prompt', ''),
+                        default_prompt=default_prompt,
+                        use_ai=bool(inputs.get('use_ai', True)),
+                        clean_generation=clean_generation,
+                    )
+                    _record_openai_usage(result, 'generate_resume')
+                    resume = result['resume']
+                    resume['bold_keywords'] = []
+                    resume['auto_bold_fit_keywords'] = False
+                    exports = _build_uploaded_docx_pdf_exports(resume=resume, profile=gen_profile, app_settings=app_settings)
+                    ats_after_generate = analyze_ats_score(resume, inputs.get('job_description', ''), target_role=inputs.get('target_role', ''))
+                ats_score_now = int((ats_after_generate or {}).get('overall_score', 0))
+                generated_job_id = str(inputs.get('selected_job_id', '') or '').strip()
+                if generated_job_id and bool(inputs.get('use_ai', True)):
+                    _report_openai_fallback_to_admin(user, generated_job_id, result)
+                if generated_job_id and _enforce_low_ats_rate_limit(user, generated_job_id, ats_score_now):
+                    st.session_state['dashboard_is_generating_resume'] = False
+                    st.session_state.pop('dashboard_pending_generation', None)
+                    st.rerun()
+                    return
+                st.session_state['last_resume'] = resume
+                st.session_state['last_exports'] = exports
+                st.session_state['last_template_id'] = 'uploaded_docx_style'
+                st.session_state['last_profile_id'] = inputs.get('profile_id', '')
+                st.session_state['last_job_description'] = inputs.get('job_description', '')
+                st.session_state['last_target_role'] = inputs.get('target_role', '')
+                st.session_state['last_job_region'] = inputs.get('current_job_region', '')
+                st.session_state['last_custom_prompt'] = inputs.get('custom_prompt', '')
+                st.session_state['last_bold_keywords'] = ''
+                st.session_state['last_auto_bold_fit_keywords'] = False
+                st.session_state['last_update_prompt'] = ''
+                st.session_state['last_generator_mode'] = result['mode']
+                if inputs.get('selected_job_id'):
+                    st.session_state['last_job_id'] = inputs.get('selected_job_id', '')
+                    st.session_state['last_job_company'] = inputs.get('selected_job_company', '')
+                _queue_editor_reload(resume, f"Resume generated in {result['mode']} mode.")
+            finally:
+                st.session_state['dashboard_is_generating_resume'] = False
+                st.session_state.pop('dashboard_pending_generation', None)
             st.rerun()
 
     with right_col:
