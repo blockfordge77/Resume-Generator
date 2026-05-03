@@ -2043,12 +2043,24 @@ def _assigned_profile_help_text(selected_profiles: list[dict], owner_map: dict[s
 
 
 def _record_openai_usage(result: dict, kind: str) -> None:
-    """Record one OpenAI call for the current user when the result came from a real API call."""
+    """Record detailed OpenAI usage logs for the current user when available."""
     mode = str((result or {}).get('mode', '')).strip().lower()
-    if not mode.startswith('openai'):
-        return
     user_id = str(st.session_state.get('current_user_id', '') or '').strip()
     if not user_id:
+        return
+
+    api_logs = (result or {}).get('api_logs', []) or []
+    if api_logs:
+        for entry in api_logs:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                storage.record_openai_call(user_id, kind=kind, details=entry)
+            except Exception:
+                pass
+        return
+
+    if not mode.startswith('openai'):
         return
     try:
         storage.record_openai_call(user_id, kind=kind)
@@ -2057,10 +2069,22 @@ def _record_openai_usage(result: dict, kind: str) -> None:
 
 
 def _record_openai_usage_for_improve(result: dict) -> None:
-    """Record one OpenAI call per ATS-improve round that actually hit the API."""
+    """Record detailed ATS-improve OpenAI logs."""
     user_id = str(st.session_state.get('current_user_id', '') or '').strip()
     if not user_id:
         return
+
+    api_logs = (result or {}).get('api_logs', []) or []
+    if api_logs:
+        for entry in api_logs:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                storage.record_openai_call(user_id, kind='ats_improve_round', details=entry)
+            except Exception:
+                pass
+        return
+
     history = (result or {}).get('history', []) or []
     for entry in history:
         round_mode = str((entry or {}).get('mode', '')).strip().lower()
@@ -2069,6 +2093,132 @@ def _record_openai_usage_for_improve(result: dict) -> None:
                 storage.record_openai_call(user_id, kind='ats_improve_round')
             except Exception:
                 pass
+
+
+def _usd_text(value) -> str:
+    if value in (None, ''):
+        return '—'
+    try:
+        return f"${float(value):,.6f}"
+    except Exception:
+        return str(value)
+
+
+def _render_openai_logs_tab() -> None:
+    calls = storage.get_openai_calls()
+    users_by_id = {str(item.get('id', '')): item for item in storage.get_users()}
+    if not calls:
+        st.info('No OpenAI usage logs recorded yet.')
+        return
+
+    days = st.selectbox('Log window', [1, 7, 30, 90, 365], index=2, key='openai_log_window_days')
+    kinds = sorted({str(item.get('kind', '')).strip() for item in calls if str(item.get('kind', '')).strip()})
+    selected_kinds = st.multiselect('Kinds', kinds, default=kinds, key='openai_log_kinds')
+
+    now = datetime.utcnow()
+    filtered = []
+    for entry in calls:
+        recorded_at = _safe_parse_datetime(entry.get('recorded_at', ''))
+        if not recorded_at:
+            continue
+        if (now - recorded_at.replace(tzinfo=None)).days >= int(days):
+            continue
+        if selected_kinds and str(entry.get('kind', '')).strip() not in selected_kinds:
+            continue
+        filtered.append(entry)
+
+    if not filtered:
+        st.info('No OpenAI logs match the current filters.')
+        return
+
+    total_calls = len(filtered)
+    total_input = sum(int(((item.get('usage', {}) or {}).get('input_tokens', 0) or 0)) for item in filtered)
+    total_output = sum(int(((item.get('usage', {}) or {}).get('output_tokens', 0) or 0)) for item in filtered)
+    total_tokens = sum(int(((item.get('usage', {}) or {}).get('total_tokens', 0) or 0)) for item in filtered)
+    total_cost = sum(float((((item.get('cost', {}) or {}).get('total_cost_usd') or 0))) for item in filtered if ((item.get('cost', {}) or {}).get('total_cost_usd') is not None))
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric('Calls', str(total_calls))
+    c2.metric('Input tokens', f"{total_input:,}")
+    c3.metric('Output tokens', f"{total_output:,}")
+    c4.metric('Estimated cost', _usd_text(total_cost if total_cost else None))
+
+    summary_rows = {}
+    for entry in filtered:
+        key = (str(entry.get('kind', '')).strip(), str(entry.get('call_kind', '')).strip(), str(entry.get('model', '')).strip())
+        row = summary_rows.setdefault(key, {'kind': key[0], 'call_kind': key[1], 'model': key[2], 'calls': 0, 'input_tokens': 0, 'output_tokens': 0, 'total_tokens': 0, 'estimated_cost_usd': 0.0, 'duration_ms': 0})
+        row['calls'] += 1
+        row['input_tokens'] += int(((entry.get('usage', {}) or {}).get('input_tokens', 0) or 0))
+        row['output_tokens'] += int(((entry.get('usage', {}) or {}).get('output_tokens', 0) or 0))
+        row['total_tokens'] += int(((entry.get('usage', {}) or {}).get('total_tokens', 0) or 0))
+        row['duration_ms'] += int(entry.get('duration_ms', 0) or 0)
+        row['estimated_cost_usd'] += float((((entry.get('cost', {}) or {}).get('total_cost_usd') or 0)))
+
+    st.markdown('**Flow summary**')
+    summary_table = []
+    for row in sorted(summary_rows.values(), key=lambda item: (item['estimated_cost_usd'], item['total_tokens']), reverse=True):
+        summary_table.append({
+            'Kind': row['kind'],
+            'Call': row['call_kind'],
+            'Model': row['model'],
+            'Calls': row['calls'],
+            'Input Tokens': row['input_tokens'],
+            'Output Tokens': row['output_tokens'],
+            'Total Tokens': row['total_tokens'],
+            'Avg Duration ms': round(row['duration_ms'] / max(1, row['calls']), 1),
+            'Estimated Cost USD': round(row['estimated_cost_usd'], 6) if row['estimated_cost_usd'] else None,
+        })
+    st.dataframe(summary_table, use_container_width=True, hide_index=True)
+
+    st.markdown('**Inspect OpenAI output**')
+    output_candidates = [entry for entry in sorted(filtered, key=lambda item: item.get('recorded_at', ''), reverse=True) if str(entry.get('output_text', '') or '').strip() or str(entry.get('output_pretty', '') or '').strip()]
+    if output_candidates:
+        label_map = {}
+        for entry in output_candidates[:100]:
+            label = f"{entry.get('recorded_at', '')} | {entry.get('call_kind', '')} | {entry.get('model', '')} | {entry.get('flow_id', '')}"
+            label_map[label] = entry
+        selected_label = st.selectbox('Select log entry', list(label_map.keys()), key='openai_output_select')
+        selected_entry = label_map.get(selected_label, output_candidates[0])
+        oc1, oc2, oc3 = st.columns(3)
+        oc1.metric('Output chars', f"{int(selected_entry.get('output_text_chars', 0) or 0):,}")
+        oc2.metric('Output tokens', f"{int(((selected_entry.get('usage', {}) or {}).get('output_tokens', 0) or 0)):,}")
+        oc3.metric('Has pretty JSON', 'Yes' if str(selected_entry.get('output_pretty', '') or '').strip() else 'No')
+        pretty_output = str(selected_entry.get('output_pretty', '') or '').strip()
+        raw_output = str(selected_entry.get('output_text', '') or '').strip()
+        if pretty_output:
+            st.text_area('Pretty output', value=pretty_output, height=320, key='openai_pretty_output_view')
+        if raw_output and raw_output != pretty_output:
+            st.text_area('Raw output', value=raw_output, height=240, key='openai_raw_output_view')
+    else:
+        st.info('No saved OpenAI output text is available for the current filtered rows yet. Generate a new resume after this patch.')
+
+    st.markdown('**Recent call log**')
+    detail_rows = []
+    for entry in sorted(filtered, key=lambda item: item.get('recorded_at', ''), reverse=True)[:300]:
+        user = users_by_id.get(str(entry.get('user_id', '')), {})
+        payload_summary = entry.get('payload_summary', {}) if isinstance(entry.get('payload_summary', {}), dict) else {}
+        detail_rows.append({
+            'Recorded At': entry.get('recorded_at', ''),
+            'User': user.get('username') or entry.get('user_id', ''),
+            'Kind': entry.get('kind', ''),
+            'Call': entry.get('call_kind', ''),
+            'Flow ID': entry.get('flow_id', ''),
+            'Attempt': entry.get('attempt', 0),
+            'Status': entry.get('status', ''),
+            'Model': entry.get('model', ''),
+            'Input Tokens': int(((entry.get('usage', {}) or {}).get('input_tokens', 0) or 0)),
+            'Output Tokens': int(((entry.get('usage', {}) or {}).get('output_tokens', 0) or 0)),
+            'Total Tokens': int(((entry.get('usage', {}) or {}).get('total_tokens', 0) or 0)),
+            'Estimated Cost USD': ((entry.get('cost', {}) or {}).get('total_cost_usd')),
+            'Duration ms': entry.get('duration_ms', 0),
+            'Payload Tokens Est.': payload_summary.get('payload_estimated_tokens', 0),
+            'JD Chars': payload_summary.get('job_description_chars', 0),
+            'Questions': payload_summary.get('question_count', 0),
+            'Expanded Techs': payload_summary.get('job_tech_expanded_count', 0),
+            'Has Output': 'Yes' if str(entry.get('output_text', '') or '').strip() else 'No',
+            'Error': entry.get('error', ''),
+        })
+    st.dataframe(detail_rows, use_container_width=True, hide_index=True)
 
 
 def _safe_parse_datetime(value: str) -> datetime | None:
@@ -2351,7 +2501,7 @@ def user_access_page(user: dict) -> None:
     users = storage.get_users()
     pending_users = [item for item in users if item.get('status') == 'pending']
     approved_users = [item for item in users if item.get('status') == 'approved']
-    pending_tab, approved_tab, metrics_tab, schedule_reviews_tab = st.tabs(['Pending requests', 'Approved users', 'Application metrics', 'Interview schedule reviews'])
+    pending_tab, approved_tab, metrics_tab, schedule_reviews_tab, openai_logs_tab = st.tabs(['Pending requests', 'Approved users', 'Application metrics', 'Interview schedule reviews', 'OpenAI logs'])
     with pending_tab:
         if not pending_users:
             st.info('No pending access requests.')
@@ -2417,6 +2567,9 @@ def user_access_page(user: dict) -> None:
 
     with schedule_reviews_tab:
         _render_schedule_reviews_tab(user)
+
+    with openai_logs_tab:
+        _render_openai_logs_tab()
 
 # ---------- Job list ----------
 

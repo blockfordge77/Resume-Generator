@@ -486,14 +486,53 @@ class Storage:
     def complete_job_scrape(self, job_id: str, patch: dict) -> None:
         self.update_job(job_id, patch)
 
-    def record_openai_call(self, user_id: str, kind: str = '') -> None:
+    def record_openai_call(self, user_id: str, kind: str = '', details: dict | None = None) -> None:
         cleaned_user = str(user_id or '').strip()
         if not cleaned_user:
             return
+        details = details if isinstance(details, dict) else {}
+        usage = details.get('usage', {}) if isinstance(details.get('usage', {}), dict) else {}
+        cost = details.get('cost', {}) if isinstance(details.get('cost', {}), dict) else {}
+        payload_summary = details.get('payload_summary', {}) if isinstance(details.get('payload_summary', {}), dict) else {}
         entry = {
             'user_id': cleaned_user,
             'kind': str(kind or '').strip(),
             'recorded_at': datetime.utcnow().isoformat() + 'Z',
+            'flow_id': str(details.get('flow_id', '')).strip(),
+            'call_kind': str(details.get('call_kind', '')).strip(),
+            'status': str(details.get('status', '')).strip() or 'success',
+            'attempt': int(details.get('attempt', 0) or 0),
+            'model': str(details.get('model', '')).strip(),
+            'schema_name': str(details.get('schema_name', '')).strip(),
+            'response_id': str(details.get('response_id', '')).strip(),
+            'duration_ms': int(details.get('duration_ms', 0) or 0),
+            'developer_message_chars': int(details.get('developer_message_chars', 0) or 0),
+            'input_estimated_tokens_local': int(details.get('input_estimated_tokens_local', 0) or 0),
+            'output_text_chars': int(details.get('output_text_chars', 0) or 0),
+            'output_estimated_tokens_local': int(details.get('output_estimated_tokens_local', 0) or 0),
+            'output_text': str(details.get('output_text', '') or ''),
+            'output_text_truncated': bool(details.get('output_text_truncated', False)),
+            'output_pretty': str(details.get('output_pretty', '') or ''),
+            'output_pretty_truncated': bool(details.get('output_pretty_truncated', False)),
+            'usage': {
+                'input_tokens': int(usage.get('input_tokens', 0) or 0),
+                'output_tokens': int(usage.get('output_tokens', 0) or 0),
+                'total_tokens': int(usage.get('total_tokens', 0) or 0),
+                'cached_input_tokens': int(usage.get('cached_input_tokens', 0) or 0),
+                'reasoning_output_tokens': int(usage.get('reasoning_output_tokens', 0) or 0),
+                'billable_input_tokens': int(usage.get('billable_input_tokens', 0) or 0),
+            },
+            'cost': {
+                'input_cost_usd': cost.get('input_cost_usd'),
+                'cached_input_cost_usd': cost.get('cached_input_cost_usd'),
+                'output_cost_usd': cost.get('output_cost_usd'),
+                'reasoning_output_cost_usd': cost.get('reasoning_output_cost_usd'),
+                'total_cost_usd': cost.get('total_cost_usd'),
+                'pricing_source': cost.get('pricing_source', {}) if isinstance(cost.get('pricing_source', {}), dict) else {},
+            },
+            'payload_summary': payload_summary,
+            'error': str(details.get('error', '')).strip(),
+            'post_validation': details.get('post_validation', {}) if isinstance(details.get('post_validation', {}), dict) else {},
         }
         with self._lock:
             items = self._read_json(self.openai_calls_path) or []
@@ -511,10 +550,47 @@ class Storage:
         for item in items:
             if not isinstance(item, dict):
                 continue
+            usage = item.get('usage', {}) if isinstance(item.get('usage', {}), dict) else {}
+            cost = item.get('cost', {}) if isinstance(item.get('cost', {}), dict) else {}
             normalized.append({
                 'user_id': str(item.get('user_id', '')).strip(),
                 'kind': str(item.get('kind', '')).strip(),
                 'recorded_at': str(item.get('recorded_at', '')).strip(),
+                'flow_id': str(item.get('flow_id', '')).strip(),
+                'call_kind': str(item.get('call_kind', '')).strip(),
+                'status': str(item.get('status', '')).strip() or 'success',
+                'attempt': int(item.get('attempt', 0) or 0),
+                'model': str(item.get('model', '')).strip(),
+                'schema_name': str(item.get('schema_name', '')).strip(),
+                'response_id': str(item.get('response_id', '')).strip(),
+                'duration_ms': int(item.get('duration_ms', 0) or 0),
+                'developer_message_chars': int(item.get('developer_message_chars', 0) or 0),
+                'input_estimated_tokens_local': int(item.get('input_estimated_tokens_local', 0) or 0),
+                'output_text_chars': int(item.get('output_text_chars', 0) or 0),
+                'output_estimated_tokens_local': int(item.get('output_estimated_tokens_local', 0) or 0),
+                'output_text': str(item.get('output_text', '') or ''),
+                'output_text_truncated': bool(item.get('output_text_truncated', False)),
+                'output_pretty': str(item.get('output_pretty', '') or ''),
+                'output_pretty_truncated': bool(item.get('output_pretty_truncated', False)),
+                'usage': {
+                    'input_tokens': int(usage.get('input_tokens', 0) or 0),
+                    'output_tokens': int(usage.get('output_tokens', 0) or 0),
+                    'total_tokens': int(usage.get('total_tokens', 0) or 0),
+                    'cached_input_tokens': int(usage.get('cached_input_tokens', 0) or 0),
+                    'reasoning_output_tokens': int(usage.get('reasoning_output_tokens', 0) or 0),
+                    'billable_input_tokens': int(usage.get('billable_input_tokens', 0) or 0),
+                },
+                'cost': {
+                    'input_cost_usd': cost.get('input_cost_usd'),
+                    'cached_input_cost_usd': cost.get('cached_input_cost_usd'),
+                    'output_cost_usd': cost.get('output_cost_usd'),
+                    'reasoning_output_cost_usd': cost.get('reasoning_output_cost_usd'),
+                    'total_cost_usd': cost.get('total_cost_usd'),
+                    'pricing_source': cost.get('pricing_source', {}) if isinstance(cost.get('pricing_source', {}), dict) else {},
+                },
+                'payload_summary': item.get('payload_summary', {}) if isinstance(item.get('payload_summary', {}), dict) else {},
+                'error': str(item.get('error', '')).strip(),
+                'post_validation': item.get('post_validation', {}) if isinstance(item.get('post_validation', {}), dict) else {},
             })
         return normalized
 
