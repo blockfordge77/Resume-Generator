@@ -697,6 +697,101 @@ def show_header(user: dict) -> None:
                     st.success('Password updated.')
                     st.rerun()
 
+
+def _paginate_items(
+    items: list,
+    page_key: str,
+    per_page: int = 20,
+    per_page_options: tuple[int, ...] = (10, 20, 50, 100),
+    filter_signature: str | None = None,
+) -> tuple[list, int]:
+    """Render pagination controls and return (page_items, start_offset).
+
+    start_offset is the 0-based index of the first returned item within the full list,
+    so callers can keep stable global numbering across pages.
+
+    When filter_signature changes between reruns, the page resets to 1 so that newly
+    filtered results show from the top instead of an out-of-range page.
+    """
+    page_state_key = f'{page_key}_page'
+    per_page_state_key = f'{page_key}_per_page'
+    sig_state_key = f'{page_key}_filter_sig'
+
+    options = list(per_page_options)
+    if not options:
+        options = [per_page]
+    default_per_page = per_page if per_page in options else options[0]
+    if per_page_state_key not in st.session_state:
+        st.session_state[per_page_state_key] = default_per_page
+
+    if filter_signature is not None and st.session_state.get(sig_state_key) != filter_signature:
+        st.session_state[sig_state_key] = filter_signature
+        st.session_state[page_state_key] = 1
+
+    effective_per_page = int(st.session_state.get(per_page_state_key, default_per_page) or default_per_page)
+    if effective_per_page <= 0:
+        effective_per_page = default_per_page
+
+    total = len(items)
+    if total == 0:
+        return items, 0
+
+    total_pages = max(1, (total + effective_per_page - 1) // effective_per_page)
+    current_page = int(st.session_state.get(page_state_key, 1) or 1)
+    current_page = max(1, min(current_page, total_pages))
+    st.session_state[page_state_key] = current_page
+
+    def _reset_to_first_page() -> None:
+        st.session_state[page_state_key] = 1
+
+    if total_pages > 1:
+        first_col, prev_col, info_col, next_col, last_col, per_page_col = st.columns([1, 1, 4, 1, 1, 1.4])
+        with first_col:
+            if st.button('≪ First', key=f'{page_key}_first', disabled=(current_page <= 1), use_container_width=True):
+                st.session_state[page_state_key] = 1
+                st.rerun()
+        with prev_col:
+            if st.button('◀ Prev', key=f'{page_key}_prev', disabled=(current_page <= 1), use_container_width=True):
+                st.session_state[page_state_key] = current_page - 1
+                st.rerun()
+        with info_col:
+            start_human = (current_page - 1) * effective_per_page + 1
+            end_human = min(current_page * effective_per_page, total)
+            st.caption(f'Page {current_page} of {total_pages} • Showing {start_human}–{end_human} of {total}')
+        with next_col:
+            if st.button('Next ▶', key=f'{page_key}_next', disabled=(current_page >= total_pages), use_container_width=True):
+                st.session_state[page_state_key] = current_page + 1
+                st.rerun()
+        with last_col:
+            if st.button('Last ≫', key=f'{page_key}_last', disabled=(current_page >= total_pages), use_container_width=True):
+                st.session_state[page_state_key] = total_pages
+                st.rerun()
+        with per_page_col:
+            st.selectbox(
+                'Per page',
+                options,
+                key=per_page_state_key,
+                label_visibility='collapsed',
+                on_change=_reset_to_first_page,
+            )
+    else:
+        info_col, per_page_col = st.columns([5, 1.4])
+        with info_col:
+            st.caption(f'Showing {total} of {total}')
+        with per_page_col:
+            st.selectbox(
+                'Per page',
+                options,
+                key=per_page_state_key,
+                label_visibility='collapsed',
+                on_change=_reset_to_first_page,
+            )
+
+    start_idx = (current_page - 1) * effective_per_page
+    end_idx = start_idx + effective_per_page
+    return items[start_idx:end_idx], start_idx
+
+
 def _resolve_output_dir(raw_value: str) -> Path:
     value = str(raw_value or 'saved_resumes').strip() or 'saved_resumes'
     path = Path(value).expanduser()
@@ -2425,7 +2520,14 @@ def _render_schedule_reviews_tab(admin_user: dict) -> None:
         return
 
     profiles_map = {item.get('id'): item for item in storage.get_profiles()}
-    for item in sorted(filtered_items, key=lambda record: str((record.get('interview_schedule') or {}).get('submitted_at', '') or record.get('created_at', '')), reverse=True):
+    sorted_items = sorted(filtered_items, key=lambda record: str((record.get('interview_schedule') or {}).get('submitted_at', '') or record.get('created_at', '')), reverse=True)
+    page_schedule, _ = _paginate_items(
+        sorted_items,
+        page_key='schedule_reviews',
+        per_page=20,
+        filter_signature=selected_status,
+    )
+    for item in page_schedule:
         schedule = item.get('interview_schedule', {}) or {}
         profile_name = (profiles_map.get(item.get('profile_id')) or {}).get('name', '') or 'Unknown profile'
         label = f"{_generated_resume_display_title(item)} • {profile_name} • {schedule.get('review_status', 'not_submitted')}"
@@ -2505,7 +2607,12 @@ def user_access_page(user: dict) -> None:
     with pending_tab:
         if not pending_users:
             st.info('No pending access requests.')
-        for pending in pending_users:
+        page_pending_users, _ = _paginate_items(
+            pending_users,
+            page_key='user_access_pending',
+            per_page=10,
+        )
+        for pending in page_pending_users:
             with st.expander(f"{pending.get('full_name') or pending.get('username')} • {pending.get('username')}"):
                 available_profiles, owner_map = _available_profiles_for_user_assignment(profiles, users, pending.get('id', ''), pending.get('assigned_profile_ids', []))
                 assigned = st.multiselect(
@@ -2535,7 +2642,12 @@ def user_access_page(user: dict) -> None:
                         st.success('Pending request removed.')
                         st.rerun()
     with approved_tab:
-        for member in approved_users:
+        page_approved_users, _ = _paginate_items(
+            approved_users,
+            page_key='user_access_approved',
+            per_page=10,
+        )
+        for member in page_approved_users:
             with st.expander(f"{member.get('full_name') or member.get('username')} • {'Admin' if member.get('is_admin') else 'User'}"):
                 available_profiles, owner_map = _available_profiles_for_user_assignment(profiles, users, member.get('id', ''), member.get('assigned_profile_ids', []))
                 assigned = st.multiselect(
@@ -2707,7 +2819,13 @@ def job_list_page(user: dict) -> None:
                 filtered_jobs.append(job)
         if not filtered_jobs:
             st.info('No approved jobs match your assigned profile markets yet.')
-        for job in filtered_jobs:
+        page_jobs, _ = _paginate_items(
+            filtered_jobs,
+            page_key='job_list_approved',
+            per_page=20,
+            filter_signature=needle,
+        )
+        for job in page_jobs:
             with st.container(border=True):
                 info_col, action_col = st.columns([5.4, 1.2], gap='medium')
                 with info_col:
@@ -2872,7 +2990,12 @@ def job_list_page(user: dict) -> None:
                 st.info('No pending jobs to review.')
             else:
                 st.caption('Pending job edits are grouped in submit forms so typing does not rerender the whole page.')
-            for job in pending_jobs:
+            page_pending, _ = _paginate_items(
+                pending_jobs,
+                page_key='job_list_pending',
+                per_page=20,
+            )
+            for job in page_pending:
                 with st.expander(f"Pending • {_job_summary_label(job)}"):
                     st.caption(f"Source: {job.get('source', 'manual')} • Scrape status: {job.get('scrape_status', 'n/a')}")
                     if job.get('scrape_error'):
@@ -2944,7 +3067,12 @@ def job_list_page(user: dict) -> None:
                 st.info('No reported jobs yet.')
             else:
                 st.caption(f'{len(reported_jobs)} reported job(s). Reports are flagged by users or auto-flagged after repeated low ATS scores.')
-            for job in reported_jobs:
+            page_reported, _ = _paginate_items(
+                reported_jobs,
+                page_key='job_list_reported',
+                per_page=20,
+            )
+            for job in page_reported:
                 reports = job.get('reports', []) or []
                 with st.expander(f"Reported • {_job_summary_label(job)} • {len(reports)} report(s)"):
                     if job.get('link'):
@@ -3266,7 +3394,20 @@ def generated_resumes_page(user: dict) -> None:
         open_items = set(open_items or [])
         st.session_state['generated_resume_open_items'] = open_items
 
-    for index, item in enumerate(reversed(filtered_items), start=1):
+    ordered_items = list(reversed(filtered_items))
+    filter_signature = '|'.join([
+        str(needle), str(selected_company), str(selected_profile),
+        selected_start_str, selected_end_str, selected_date_str,
+    ])
+    page_items, page_start_offset = _paginate_items(
+        ordered_items,
+        page_key='generated_resumes_list',
+        per_page=20,
+        filter_signature=filter_signature,
+    )
+
+    for offset, item in enumerate(page_items, start=1):
+        index = page_start_offset + offset
         created_at = item.get('created_at', '')
         saved_id = item.get('saved_resume_id', '')
         item_key = f"{index}_{created_at}_{saved_id}"
