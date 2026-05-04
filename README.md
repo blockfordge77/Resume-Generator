@@ -395,3 +395,23 @@ SKILLS
 ```
 
 The app will keep the DOCX style and replace the matching content areas.
+
+
+## Extension API
+
+This project also includes a separate `extension_api/` feature so the original Streamlit app and the browser-extension backend can run side by side.
+
+Run the original app with `start.bat` / `start.sh`.
+Run the extension API with `start_extension_api.bat` / `start_extension_api.sh`.
+
+
+## Extension API URL and browser extension install
+
+Set `EXTENSION_API_BASE_URL` in your root `.env`. The extension config file `browser_extension/config.js` is generated from that value when you start the extension API.
+
+Useful URLs after starting the extension API:
+- Docs: `http://127.0.0.1:8010/docs`
+- Install page: `http://127.0.0.1:8010/api/ext/extension/install`
+- Download zip: `http://127.0.0.1:8010/api/ext/extension/download`
+
+A real **Add to Chrome** button is not available for a local/private extension unless it is published in the Chrome Web Store.
