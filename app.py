@@ -784,6 +784,15 @@ def _render_copy_value_notice(title: str, value: str, helper_text: str = 'Click 
         height=76,
     )
 
+def _is_job_consumed_resume_record(item: dict) -> bool:
+    status = _company_message_status(item)
+    return status in {'applied', 'pending', 'saved', 'update_later'}
+
+def _is_applied_resume_record(item: dict) -> bool:
+    return (
+        str(item.get('company_message_status', '') or '').strip().lower() == 'applied'
+        and bool(str(item.get('company_message', '') or '').strip())
+    )
 
 def _build_applied_map_for_user(user: dict, accessible_profiles: list[dict]) -> dict[str, set[str]]:
     generated_items = storage.get_generated_resumes()
@@ -792,6 +801,9 @@ def _build_applied_map_for_user(user: dict, accessible_profiles: list[dict]) -> 
     allowed_profile_ids = {str(item.get('id', '')) for item in accessible_profiles}
     applied_map: dict[str, set[str]] = {}
     for item in generated_items:
+        if not _is_job_consumed_resume_record(item):
+            continue
+
         job_id = str(item.get('job_id', '')).strip()
         profile_id = str(item.get('profile_id', '')).strip()
         if job_id and profile_id and (not allowed_profile_ids or profile_id in allowed_profile_ids):
@@ -1206,8 +1218,11 @@ def _finalize_saved_resume(message: str, status: str) -> None:
     payload = copy.deepcopy(st.session_state.get('pending_saved_resume') or {})
     if not payload:
         return
+
+    normalized_status = 'applied' if str(status or '').strip().lower() == 'applied' else 'pending'
+
     payload['company_message'] = str(message or '').strip()
-    payload['company_message_status'] = status
+    payload['company_message_status'] = normalized_status
     payload['company_message_updated_at'] = datetime.utcnow().isoformat() + 'Z'
     storage.save_generated_resume(payload)
     _write_saved_resume_metadata(payload)
@@ -1218,6 +1233,12 @@ def _finalize_saved_resume(message: str, status: str) -> None:
     st.session_state['saved_resume_notice'] = 'Resume saved. The PDF was downloaded to your browser.'
     st.session_state['pending_saved_resume'] = None
     st.session_state['company_message_dialog_reset_needed'] = True
+
+    current_job_id = str(payload.get('job_id', '') or '').strip()
+    if current_job_id:
+        _advance_to_next_dashboard_job(current_job_id)
+    else:
+        _reset_dashboard_generated_resume_state()
 
 
 def _update_saved_resume_message(item: dict, message: str) -> None:
@@ -1405,6 +1426,14 @@ def _report_openai_fallback_to_admin(user: dict, job_id: str, result: dict) -> N
         'source': 'system',
     })
 
+def _reset_dashboard_generated_resume_state() -> None:
+    st.session_state['last_resume'] = None
+    st.session_state['last_exports'] = {}
+    st.session_state['last_generator_mode'] = ''
+    st.session_state['last_ats_improve_history'] = []
+    st.session_state['editor_loaded_signature'] = ''
+    st.session_state['editor_pending_resume'] = None
+    st.session_state['editor_notice'] = ''
 
 def _advance_to_next_dashboard_job(current_job_id: str) -> None:
     user_id = st.session_state.get('current_user_id', '')
@@ -1445,28 +1474,34 @@ def _post_download_dialog() -> None:
         st.session_state.pop('company_message_dialog_value', None)
 
     st.write(f"PDF download filename: `{payload.get('download_filename', '')}`")
-    st.caption('The PDF download has started in your browser. Add the company email or application message now. If you do not have it yet, choose Update later. Cancel keeps this draft out of Generated Resumes.')
-    st.text_area('Company message / application email', key='company_message_dialog_value', height=180, placeholder='Paste the email or application message from the company here...')
-    c1, c2, c3 = st.columns(3)
+    st.caption('The PDF download has started in your browser. Add the company email or application message now. If you do not have it yet, choose Pending.')
+    st.text_area(
+        'Company message / application email',
+        key='company_message_dialog_value',
+        height=180,
+        placeholder='Paste the email or application message from the company here...',
+    )
+
+    c1, c2 = st.columns(2)
+
     with c1:
-        if st.button('Save message', use_container_width=True):
+        if st.button('Applied', use_container_width=True):
             message = st.session_state.get('company_message_dialog_value', '').strip()
+            target_role = _target_role_from_payload(payload)
+
             if not message:
-                st.error('Paste the company message or choose Update later / Cancel.')
+                st.error('Paste the company message or choose Pending.')
+            elif not target_role:
+                st.error('Target role is missing, so this message cannot be marked Applied.')
+            elif not _role_matches_message(message, target_role):
+                st.error('This is not feedback message, input correct feedback message')
             else:
-                _finalize_saved_resume(message, 'saved')
+                _finalize_saved_resume(message, 'applied')
                 st.rerun()
     with c2:
-        if st.button('Update later', use_container_width=True):
-            _finalize_saved_resume('', 'update_later')
+        if st.button('Pending', use_container_width=True):
+            _finalize_saved_resume('', 'pending')
             st.rerun()
-    with c3:
-        if st.button('Cancel', use_container_width=True):
-            st.session_state['saved_resume_notice'] = 'Files were saved locally, but this resume was not added to Generated Resumes.'
-            st.session_state['pending_saved_resume'] = None
-            st.session_state['company_message_dialog_reset_needed'] = True
-            st.rerun()
-
 
 # ---------- Dashboard ----------
 
@@ -1564,6 +1599,7 @@ def dashboard_page(user: dict) -> None:
 
         selected_job_id = selected_job.get('id', '')
         if selected_job_id and selected_job_id != st.session_state.get('last_job_id'):
+            _reset_dashboard_generated_resume_state()
             st.session_state['last_job_id'] = selected_job_id
             st.session_state['last_job_company'] = selected_job.get('company', '')
             st.session_state['last_job_link'] = selected_job.get('link', '')
@@ -1572,6 +1608,7 @@ def dashboard_page(user: dict) -> None:
             st.session_state['last_job_region'] = _normalize_region(selected_job.get('region', ''))
             st.rerun()
         elif not selected_job_id and st.session_state.get('last_job_id'):
+            _reset_dashboard_generated_resume_state()
             st.session_state['last_job_id'] = ''
             st.session_state['last_job_company'] = ''
             st.session_state['last_job_link'] = ''
@@ -2241,6 +2278,9 @@ def _application_metrics_rows() -> list[dict]:
     records = storage.get_generated_resumes()
     rows: list[dict] = []
     for item in records:
+        if not _is_applied_resume_record(item):
+            continue
+
         created_dt = _safe_parse_datetime(item.get('created_at', ''))
         if not created_dt:
             continue
@@ -2682,6 +2722,9 @@ def job_list_page(user: dict) -> None:
         generated_items = [item for item in generated_items if item.get('created_by_user_id') == user.get('id')]
     applied_map: dict[str, set[str]] = {}
     for item in generated_items:
+        if not _is_applied_resume_record(item):
+            continue
+        
         job_id = str(item.get('job_id', '')).strip()
         profile_id = str(item.get('profile_id', '')).strip()
         if job_id and profile_id:
@@ -3168,6 +3211,86 @@ def _render_interview_schedule_tab(item: dict, item_key: str, user: dict) -> Non
             st.success('Interview schedule submitted and marked as waiting for review.')
             st.rerun()
 
+def _company_message_text(item: dict) -> str:
+    return str(item.get('company_message', '') or '').strip()
+
+
+def _company_message_status(item: dict) -> str:
+    return str(item.get('company_message_status', '') or '').strip().lower()
+
+
+def _is_applied_resume_record(item: dict) -> bool:
+    return _company_message_status(item) == 'applied' and bool(_company_message_text(item))
+
+
+def _matches_generated_resume_status_filter(item: dict, selected_status: str) -> bool:
+    selected_status = str(selected_status or 'All').strip()
+
+    if selected_status == 'All':
+        return True
+    if selected_status == 'Applied':
+        return _is_applied_resume_record(item)
+    if selected_status == 'Pending':
+        return not _is_applied_resume_record(item)
+
+    return True
+
+def _normalize_role_text(value: str) -> str:
+    text = str(value or '')
+    text = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', text)
+    text = text.lower()
+    text = re.sub(r'[^a-z0-9+#.]+', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+def _role_tokens(value: str) -> list[str]:
+    normalized = _normalize_role_text(value)
+    stop_words = {'at', 'for', 'the', 'a', 'an', 'role', 'position', 'job'}
+    return [
+        token
+        for token in normalized.split()
+        if len(token) > 1 and token not in stop_words
+    ]
+
+
+def _role_matches_message(message: str, role: str) -> bool:
+    normalized_message = _normalize_role_text(message)
+    normalized_role = _normalize_role_text(role)
+
+    if not normalized_message or not normalized_role:
+        return False
+
+    if normalized_role in normalized_message:
+        return True
+
+    message_tokens = set(normalized_message.split())
+    message_compact = re.sub(r'[^a-z0-9+#.]+', '', normalized_message)
+
+    role_tokens = _role_tokens(role)
+    if not role_tokens:
+        return False
+
+    return all(
+        token in message_tokens or token in message_compact
+        for token in role_tokens
+    )
+
+
+def _target_role_from_payload(payload_value: dict) -> str:
+    return (
+        str(payload_value.get('target_role', '') or '').strip()
+        or str(payload_value.get('job_title', '') or '').strip()
+        or str(st.session_state.get('last_target_role', '') or '').strip()
+    )
+
+
+def _target_role_from_saved_item(item: dict) -> str:
+    return (
+        str(item.get('target_role', '') or '').strip()
+        or str(item.get('job_title', '') or '').strip()
+        or str((item.get('resume', {}) or {}).get('headline', '') or '').strip()
+    )
 
 def generated_resumes_page(user: dict) -> None:
     show_header(user)
@@ -3196,19 +3319,31 @@ def generated_resumes_page(user: dict) -> None:
 
     title_placeholder = st.empty()
     if admin_view:
-        f1, f2, f3, f4, f5 = st.columns([2.0, 1.0, 1.0, 0.9, 0.9])
+        f1, f2, f3, f4, f5, f6 = st.columns([1.7, 0.9, 0.9, 0.9, 0.9, 0.9])
     else:
-        f1, f2, f3, f4 = st.columns([2.1, 1.0, 1.0, 1.0])
+        f1, f2, f3, f4, f5 = st.columns([1.8, 0.9, 0.9, 0.9, 0.9])
+
     with f1:
-        search_text = st.text_input('Search applied resumes', placeholder='Search by company, job title, profile, application message, or job description', key='generated_resume_search_text')
+        search_text = st.text_input(
+            'Search applied resumes',
+            placeholder='Search by company, job title, profile, application message, or job description',
+            key='generated_resume_search_text',
+        )
     with f2:
         selected_company = st.selectbox('Company', ['All'] + company_options, key='generated_resume_search_company')
     with f3:
         selected_profile = st.selectbox('Profile', ['All'] + profile_options, key='generated_resume_search_profile')
+
     if admin_view:
         with f4:
-            selected_start_date = st.date_input('From', value=default_start, key='generated_resume_filter_start_date')
+            selected_apply_status = st.selectbox(
+                'Status',
+                ['All', 'Applied', 'Pending'],
+                key='generated_resume_apply_status_filter',
+            )
         with f5:
+            selected_start_date = st.date_input('From', value=default_start, key='generated_resume_filter_start_date')
+        with f6:
             selected_end_date = st.date_input('To', value=default_end, key='generated_resume_filter_end_date')
         if selected_start_date > selected_end_date:
             selected_start_date, selected_end_date = selected_end_date, selected_start_date
@@ -3216,6 +3351,12 @@ def generated_resumes_page(user: dict) -> None:
             st.session_state['generated_resume_filter_end_date'] = selected_end_date
     else:
         with f4:
+            selected_apply_status = st.selectbox(
+                'Status',
+                ['All', 'Applied', 'Pending'],
+                key='generated_resume_apply_status_filter',
+            )
+        with f5:
             selected_date = st.date_input('Application date', value=default_date, key='generated_resume_filter_date')
 
     filtered_items = []
@@ -3230,6 +3371,9 @@ def generated_resumes_page(user: dict) -> None:
         selected_date_str = selected_date.strftime('%Y-%m-%d') if isinstance(selected_date, date) else ''
 
     for item in items:
+        if not _matches_generated_resume_status_filter(item, selected_apply_status):
+            continue
+
         profile_name = str((profiles_map.get(item.get('profile_id')) or {}).get('name', '')).strip()
         if selected_company != 'All' and str(item.get('job_company', '')).strip() != selected_company:
             continue
@@ -3321,11 +3465,17 @@ def generated_resumes_page(user: dict) -> None:
                 st.text_area('Company message / application email', key=company_message_key, height=160)
                 if st.button('Save company message', key=f"save_company_message_{item_key}", use_container_width=True):
                     company_message_value = st.session_state.get(company_message_key, '').strip()
+                    target_role = _target_role_from_saved_item(item)
+
                     if not company_message_value:
                         st.error('Paste the company message first.')
+                    elif not target_role:
+                        st.error('Target role is missing, so this message cannot be saved as Applied.')
+                    elif not _role_matches_message(company_message_value, target_role):
+                        st.error('This is not feedback message, input correct feedback message')
                     else:
                         _update_saved_resume_message(item, company_message_value)
-                        st.success('Company message saved.')
+                        st.success('Company message saved as applied.')
                         st.rerun()
             with saved_tabs['ATS Score']:
                 ats_cache = st.session_state.setdefault('generated_resume_ats_cache', {})
