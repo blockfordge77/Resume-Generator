@@ -697,6 +697,101 @@ def show_header(user: dict) -> None:
                     st.success('Password updated.')
                     st.rerun()
 
+
+def _paginate_items(
+    items: list,
+    page_key: str,
+    per_page: int = 20,
+    per_page_options: tuple[int, ...] = (10, 20, 50, 100),
+    filter_signature: str | None = None,
+) -> tuple[list, int]:
+    """Render pagination controls and return (page_items, start_offset).
+
+    start_offset is the 0-based index of the first returned item within the full list,
+    so callers can keep stable global numbering across pages.
+
+    When filter_signature changes between reruns, the page resets to 1 so that newly
+    filtered results show from the top instead of an out-of-range page.
+    """
+    page_state_key = f'{page_key}_page'
+    per_page_state_key = f'{page_key}_per_page'
+    sig_state_key = f'{page_key}_filter_sig'
+
+    options = list(per_page_options)
+    if not options:
+        options = [per_page]
+    default_per_page = per_page if per_page in options else options[0]
+    if per_page_state_key not in st.session_state:
+        st.session_state[per_page_state_key] = default_per_page
+
+    if filter_signature is not None and st.session_state.get(sig_state_key) != filter_signature:
+        st.session_state[sig_state_key] = filter_signature
+        st.session_state[page_state_key] = 1
+
+    effective_per_page = int(st.session_state.get(per_page_state_key, default_per_page) or default_per_page)
+    if effective_per_page <= 0:
+        effective_per_page = default_per_page
+
+    total = len(items)
+    if total == 0:
+        return items, 0
+
+    total_pages = max(1, (total + effective_per_page - 1) // effective_per_page)
+    current_page = int(st.session_state.get(page_state_key, 1) or 1)
+    current_page = max(1, min(current_page, total_pages))
+    st.session_state[page_state_key] = current_page
+
+    def _reset_to_first_page() -> None:
+        st.session_state[page_state_key] = 1
+
+    if total_pages > 1:
+        first_col, prev_col, info_col, next_col, last_col, per_page_col = st.columns([1, 1, 4, 1, 1, 1.4])
+        with first_col:
+            if st.button('≪ First', key=f'{page_key}_first', disabled=(current_page <= 1), use_container_width=True):
+                st.session_state[page_state_key] = 1
+                st.rerun()
+        with prev_col:
+            if st.button('◀ Prev', key=f'{page_key}_prev', disabled=(current_page <= 1), use_container_width=True):
+                st.session_state[page_state_key] = current_page - 1
+                st.rerun()
+        with info_col:
+            start_human = (current_page - 1) * effective_per_page + 1
+            end_human = min(current_page * effective_per_page, total)
+            st.caption(f'Page {current_page} of {total_pages} • Showing {start_human}–{end_human} of {total}')
+        with next_col:
+            if st.button('Next ▶', key=f'{page_key}_next', disabled=(current_page >= total_pages), use_container_width=True):
+                st.session_state[page_state_key] = current_page + 1
+                st.rerun()
+        with last_col:
+            if st.button('Last ≫', key=f'{page_key}_last', disabled=(current_page >= total_pages), use_container_width=True):
+                st.session_state[page_state_key] = total_pages
+                st.rerun()
+        with per_page_col:
+            st.selectbox(
+                'Per page',
+                options,
+                key=per_page_state_key,
+                label_visibility='collapsed',
+                on_change=_reset_to_first_page,
+            )
+    else:
+        info_col, per_page_col = st.columns([5, 1.4])
+        with info_col:
+            st.caption(f'Showing {total} of {total}')
+        with per_page_col:
+            st.selectbox(
+                'Per page',
+                options,
+                key=per_page_state_key,
+                label_visibility='collapsed',
+                on_change=_reset_to_first_page,
+            )
+
+    start_idx = (current_page - 1) * effective_per_page
+    end_idx = start_idx + effective_per_page
+    return items[start_idx:end_idx], start_idx
+
+
 def _resolve_output_dir(raw_value: str) -> Path:
     value = str(raw_value or 'saved_resumes').strip() or 'saved_resumes'
     path = Path(value).expanduser()
@@ -1387,6 +1482,25 @@ def _enforce_low_ats_rate_limit(user: dict, job_id: str, ats_score: int) -> bool
     return True
 
 
+def _report_openai_fallback_to_admin(user: dict, job_id: str, result: dict) -> None:
+    """Flag the job for admin review when OpenAI generation was requested but fell back to demo."""
+    job_id = str(job_id or '').strip()
+    if not job_id:
+        return
+    mode = str((result or {}).get('mode', '')).strip().lower()
+    if mode != 'demo-fallback':
+        return
+    note = str(((result or {}).get('resume') or {}).get('generation_note', '') or '').strip()
+    detail = note or 'OpenAI generation failed; system fell back to demo mode.'
+    storage.add_job_report(job_id, {
+        'reason': f'Auto-flagged: OpenAI resume generation failed and fell back to demo mode. Detail: {detail}',
+        'reported_by_user_id': (user or {}).get('id', ''),
+        'reported_by_username': (user or {}).get('username', ''),
+        'reported_at': datetime.utcnow().isoformat() + 'Z',
+        'source': 'system',
+    })
+
+
 def _advance_to_next_dashboard_job(current_job_id: str) -> None:
     user_id = st.session_state.get('current_user_id', '')
     user_record = storage.get_user_by_id(user_id) if user_id else None
@@ -1607,53 +1721,83 @@ def dashboard_page(user: dict) -> None:
         job_description = st.text_area('Job description', value=st.session_state.get('last_job_description', ''), height=330, placeholder='Paste the full job description here...')
         custom_prompt = st.text_area('Custom resume prompt (optional)', value=st.session_state.get('last_custom_prompt', ''), height=110, placeholder='Example: Keep the resume sharply aligned to backend ownership, emphasize exact named tech stacks in each company bullet, and avoid generic wording.')
 
-        create_clicked = st.button('Create tailored resume', type='primary', use_container_width=True)
+        is_generating_resume = bool(st.session_state.get('dashboard_is_generating_resume', False))
+        create_clicked = st.button(
+            'Create tailored resume',
+            type='primary',
+            use_container_width=True,
+            disabled=is_generating_resume,
+            key='dashboard_create_tailored_resume_button',
+        )
 
-        if create_clicked:
+        if create_clicked and not is_generating_resume:
             if not job_description.strip():
                 st.error('Please paste a job description first.')
                 return
             if not _profile_has_uploaded_resume(profile):
                 st.error('no resume so must upload resume')
                 return
-            with st.spinner('Generating resume content and export files...'):
-                result = generate_resume_content(
-                    profile=profile,
-                    job_description=job_description,
-                    target_role=target_role,
-                    custom_prompt=custom_prompt,
-                    default_prompt=default_prompt,
-                    use_ai=use_ai,
-                    clean_generation=clean_generation,
-                )
-                _record_openai_usage(result, 'generate_resume')
-                resume = result['resume']
-                resume['bold_keywords'] = []
-                resume['auto_bold_fit_keywords'] = False
-                exports = _build_uploaded_docx_pdf_exports(resume=resume, profile=profile, app_settings=app_settings)
-                ats_after_generate = analyze_ats_score(resume, job_description, target_role=target_role)
-            ats_score_now = int((ats_after_generate or {}).get('overall_score', 0))
-            generated_job_id = str(selected_job.get('id', '') or '').strip()
-            if generated_job_id and _enforce_low_ats_rate_limit(user, generated_job_id, ats_score_now):
-                st.rerun()
-                return
-            st.session_state['last_resume'] = resume
-            st.session_state['last_exports'] = exports
-            st.session_state['last_template_id'] = 'uploaded_docx_style'
-            st.session_state['last_profile_id'] = profile.get('id')
-            st.session_state['last_job_link'] = st.session_state.get('last_job_link', '')
-            st.session_state['last_job_description'] = job_description
-            st.session_state['last_target_role'] = target_role
-            st.session_state['last_job_region'] = current_job_region
-            st.session_state['last_custom_prompt'] = custom_prompt
-            st.session_state['last_bold_keywords'] = ''
-            st.session_state['last_auto_bold_fit_keywords'] = False
-            st.session_state['last_update_prompt'] = ''
-            st.session_state['last_generator_mode'] = result['mode']
-            if selected_job.get('id'):
-                st.session_state['last_job_id'] = selected_job.get('id', '')
-                st.session_state['last_job_company'] = selected_job.get('company', '')
-            _queue_editor_reload(resume, f"Resume generated in {result['mode']} mode.")
+            st.session_state['dashboard_is_generating_resume'] = True
+            st.session_state['dashboard_pending_generation'] = {
+                'profile_id': profile.get('id'),
+                'job_description': job_description,
+                'target_role': target_role,
+                'custom_prompt': custom_prompt,
+                'use_ai': bool(use_ai),
+                'current_job_region': current_job_region,
+                'selected_job_id': selected_job.get('id', ''),
+                'selected_job_company': selected_job.get('company', ''),
+            }
+            st.rerun()
+
+        if is_generating_resume:
+            inputs = st.session_state.get('dashboard_pending_generation') or {}
+            gen_profile = storage.get_profile_by_id(inputs.get('profile_id', '')) or profile
+            try:
+                with st.spinner('Generating resume content and export files...'):
+                    result = generate_resume_content(
+                        profile=gen_profile,
+                        job_description=inputs.get('job_description', ''),
+                        target_role=inputs.get('target_role', ''),
+                        custom_prompt=inputs.get('custom_prompt', ''),
+                        default_prompt=default_prompt,
+                        use_ai=bool(inputs.get('use_ai', True)),
+                        clean_generation=clean_generation,
+                    )
+                    _record_openai_usage(result, 'generate_resume')
+                    resume = result['resume']
+                    resume['bold_keywords'] = []
+                    resume['auto_bold_fit_keywords'] = False
+                    exports = _build_uploaded_docx_pdf_exports(resume=resume, profile=gen_profile, app_settings=app_settings)
+                    ats_after_generate = analyze_ats_score(resume, inputs.get('job_description', ''), target_role=inputs.get('target_role', ''))
+                ats_score_now = int((ats_after_generate or {}).get('overall_score', 0))
+                generated_job_id = str(inputs.get('selected_job_id', '') or '').strip()
+                if generated_job_id and bool(inputs.get('use_ai', True)):
+                    _report_openai_fallback_to_admin(user, generated_job_id, result)
+                if generated_job_id and _enforce_low_ats_rate_limit(user, generated_job_id, ats_score_now):
+                    st.session_state['dashboard_is_generating_resume'] = False
+                    st.session_state.pop('dashboard_pending_generation', None)
+                    st.rerun()
+                    return
+                st.session_state['last_resume'] = resume
+                st.session_state['last_exports'] = exports
+                st.session_state['last_template_id'] = 'uploaded_docx_style'
+                st.session_state['last_profile_id'] = inputs.get('profile_id', '')
+                st.session_state['last_job_description'] = inputs.get('job_description', '')
+                st.session_state['last_target_role'] = inputs.get('target_role', '')
+                st.session_state['last_job_region'] = inputs.get('current_job_region', '')
+                st.session_state['last_custom_prompt'] = inputs.get('custom_prompt', '')
+                st.session_state['last_bold_keywords'] = ''
+                st.session_state['last_auto_bold_fit_keywords'] = False
+                st.session_state['last_update_prompt'] = ''
+                st.session_state['last_generator_mode'] = result['mode']
+                if inputs.get('selected_job_id'):
+                    st.session_state['last_job_id'] = inputs.get('selected_job_id', '')
+                    st.session_state['last_job_company'] = inputs.get('selected_job_company', '')
+                _queue_editor_reload(resume, f"Resume generated in {result['mode']} mode.")
+            finally:
+                st.session_state['dashboard_is_generating_resume'] = False
+                st.session_state.pop('dashboard_pending_generation', None)
             st.rerun()
 
     with right_col:
@@ -1994,12 +2138,24 @@ def _assigned_profile_help_text(selected_profiles: list[dict], owner_map: dict[s
 
 
 def _record_openai_usage(result: dict, kind: str) -> None:
-    """Record one OpenAI call for the current user when the result came from a real API call."""
+    """Record detailed OpenAI usage logs for the current user when available."""
     mode = str((result or {}).get('mode', '')).strip().lower()
-    if not mode.startswith('openai'):
-        return
     user_id = str(st.session_state.get('current_user_id', '') or '').strip()
     if not user_id:
+        return
+
+    api_logs = (result or {}).get('api_logs', []) or []
+    if api_logs:
+        for entry in api_logs:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                storage.record_openai_call(user_id, kind=kind, details=entry)
+            except Exception:
+                pass
+        return
+
+    if not mode.startswith('openai'):
         return
     try:
         storage.record_openai_call(user_id, kind=kind)
@@ -2008,10 +2164,22 @@ def _record_openai_usage(result: dict, kind: str) -> None:
 
 
 def _record_openai_usage_for_improve(result: dict) -> None:
-    """Record one OpenAI call per ATS-improve round that actually hit the API."""
+    """Record detailed ATS-improve OpenAI logs."""
     user_id = str(st.session_state.get('current_user_id', '') or '').strip()
     if not user_id:
         return
+
+    api_logs = (result or {}).get('api_logs', []) or []
+    if api_logs:
+        for entry in api_logs:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                storage.record_openai_call(user_id, kind='ats_improve_round', details=entry)
+            except Exception:
+                pass
+        return
+
     history = (result or {}).get('history', []) or []
     for entry in history:
         round_mode = str((entry or {}).get('mode', '')).strip().lower()
@@ -2020,6 +2188,132 @@ def _record_openai_usage_for_improve(result: dict) -> None:
                 storage.record_openai_call(user_id, kind='ats_improve_round')
             except Exception:
                 pass
+
+
+def _usd_text(value) -> str:
+    if value in (None, ''):
+        return '—'
+    try:
+        return f"${float(value):,.6f}"
+    except Exception:
+        return str(value)
+
+
+def _render_openai_logs_tab() -> None:
+    calls = storage.get_openai_calls()
+    users_by_id = {str(item.get('id', '')): item for item in storage.get_users()}
+    if not calls:
+        st.info('No OpenAI usage logs recorded yet.')
+        return
+
+    days = st.selectbox('Log window', [1, 7, 30, 90, 365], index=2, key='openai_log_window_days')
+    kinds = sorted({str(item.get('kind', '')).strip() for item in calls if str(item.get('kind', '')).strip()})
+    selected_kinds = st.multiselect('Kinds', kinds, default=kinds, key='openai_log_kinds')
+
+    now = datetime.utcnow()
+    filtered = []
+    for entry in calls:
+        recorded_at = _safe_parse_datetime(entry.get('recorded_at', ''))
+        if not recorded_at:
+            continue
+        if (now - recorded_at.replace(tzinfo=None)).days >= int(days):
+            continue
+        if selected_kinds and str(entry.get('kind', '')).strip() not in selected_kinds:
+            continue
+        filtered.append(entry)
+
+    if not filtered:
+        st.info('No OpenAI logs match the current filters.')
+        return
+
+    total_calls = len(filtered)
+    total_input = sum(int(((item.get('usage', {}) or {}).get('input_tokens', 0) or 0)) for item in filtered)
+    total_output = sum(int(((item.get('usage', {}) or {}).get('output_tokens', 0) or 0)) for item in filtered)
+    total_tokens = sum(int(((item.get('usage', {}) or {}).get('total_tokens', 0) or 0)) for item in filtered)
+    total_cost = sum(float((((item.get('cost', {}) or {}).get('total_cost_usd') or 0))) for item in filtered if ((item.get('cost', {}) or {}).get('total_cost_usd') is not None))
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric('Calls', str(total_calls))
+    c2.metric('Input tokens', f"{total_input:,}")
+    c3.metric('Output tokens', f"{total_output:,}")
+    c4.metric('Estimated cost', _usd_text(total_cost if total_cost else None))
+
+    summary_rows = {}
+    for entry in filtered:
+        key = (str(entry.get('kind', '')).strip(), str(entry.get('call_kind', '')).strip(), str(entry.get('model', '')).strip())
+        row = summary_rows.setdefault(key, {'kind': key[0], 'call_kind': key[1], 'model': key[2], 'calls': 0, 'input_tokens': 0, 'output_tokens': 0, 'total_tokens': 0, 'estimated_cost_usd': 0.0, 'duration_ms': 0})
+        row['calls'] += 1
+        row['input_tokens'] += int(((entry.get('usage', {}) or {}).get('input_tokens', 0) or 0))
+        row['output_tokens'] += int(((entry.get('usage', {}) or {}).get('output_tokens', 0) or 0))
+        row['total_tokens'] += int(((entry.get('usage', {}) or {}).get('total_tokens', 0) or 0))
+        row['duration_ms'] += int(entry.get('duration_ms', 0) or 0)
+        row['estimated_cost_usd'] += float((((entry.get('cost', {}) or {}).get('total_cost_usd') or 0)))
+
+    st.markdown('**Flow summary**')
+    summary_table = []
+    for row in sorted(summary_rows.values(), key=lambda item: (item['estimated_cost_usd'], item['total_tokens']), reverse=True):
+        summary_table.append({
+            'Kind': row['kind'],
+            'Call': row['call_kind'],
+            'Model': row['model'],
+            'Calls': row['calls'],
+            'Input Tokens': row['input_tokens'],
+            'Output Tokens': row['output_tokens'],
+            'Total Tokens': row['total_tokens'],
+            'Avg Duration ms': round(row['duration_ms'] / max(1, row['calls']), 1),
+            'Estimated Cost USD': round(row['estimated_cost_usd'], 6) if row['estimated_cost_usd'] else None,
+        })
+    st.dataframe(summary_table, use_container_width=True, hide_index=True)
+
+    st.markdown('**Inspect OpenAI output**')
+    output_candidates = [entry for entry in sorted(filtered, key=lambda item: item.get('recorded_at', ''), reverse=True) if str(entry.get('output_text', '') or '').strip() or str(entry.get('output_pretty', '') or '').strip()]
+    if output_candidates:
+        label_map = {}
+        for entry in output_candidates[:100]:
+            label = f"{entry.get('recorded_at', '')} | {entry.get('call_kind', '')} | {entry.get('model', '')} | {entry.get('flow_id', '')}"
+            label_map[label] = entry
+        selected_label = st.selectbox('Select log entry', list(label_map.keys()), key='openai_output_select')
+        selected_entry = label_map.get(selected_label, output_candidates[0])
+        oc1, oc2, oc3 = st.columns(3)
+        oc1.metric('Output chars', f"{int(selected_entry.get('output_text_chars', 0) or 0):,}")
+        oc2.metric('Output tokens', f"{int(((selected_entry.get('usage', {}) or {}).get('output_tokens', 0) or 0)):,}")
+        oc3.metric('Has pretty JSON', 'Yes' if str(selected_entry.get('output_pretty', '') or '').strip() else 'No')
+        pretty_output = str(selected_entry.get('output_pretty', '') or '').strip()
+        raw_output = str(selected_entry.get('output_text', '') or '').strip()
+        if pretty_output:
+            st.text_area('Pretty output', value=pretty_output, height=320, key='openai_pretty_output_view')
+        if raw_output and raw_output != pretty_output:
+            st.text_area('Raw output', value=raw_output, height=240, key='openai_raw_output_view')
+    else:
+        st.info('No saved OpenAI output text is available for the current filtered rows yet. Generate a new resume after this patch.')
+
+    st.markdown('**Recent call log**')
+    detail_rows = []
+    for entry in sorted(filtered, key=lambda item: item.get('recorded_at', ''), reverse=True)[:300]:
+        user = users_by_id.get(str(entry.get('user_id', '')), {})
+        payload_summary = entry.get('payload_summary', {}) if isinstance(entry.get('payload_summary', {}), dict) else {}
+        detail_rows.append({
+            'Recorded At': entry.get('recorded_at', ''),
+            'User': user.get('username') or entry.get('user_id', ''),
+            'Kind': entry.get('kind', ''),
+            'Call': entry.get('call_kind', ''),
+            'Flow ID': entry.get('flow_id', ''),
+            'Attempt': entry.get('attempt', 0),
+            'Status': entry.get('status', ''),
+            'Model': entry.get('model', ''),
+            'Input Tokens': int(((entry.get('usage', {}) or {}).get('input_tokens', 0) or 0)),
+            'Output Tokens': int(((entry.get('usage', {}) or {}).get('output_tokens', 0) or 0)),
+            'Total Tokens': int(((entry.get('usage', {}) or {}).get('total_tokens', 0) or 0)),
+            'Estimated Cost USD': ((entry.get('cost', {}) or {}).get('total_cost_usd')),
+            'Duration ms': entry.get('duration_ms', 0),
+            'Payload Tokens Est.': payload_summary.get('payload_estimated_tokens', 0),
+            'JD Chars': payload_summary.get('job_description_chars', 0),
+            'Questions': payload_summary.get('question_count', 0),
+            'Expanded Techs': payload_summary.get('job_tech_expanded_count', 0),
+            'Has Output': 'Yes' if str(entry.get('output_text', '') or '').strip() else 'No',
+            'Error': entry.get('error', ''),
+        })
+    st.dataframe(detail_rows, use_container_width=True, hide_index=True)
 
 
 def _safe_parse_datetime(value: str) -> datetime | None:
@@ -2226,7 +2520,14 @@ def _render_schedule_reviews_tab(admin_user: dict) -> None:
         return
 
     profiles_map = {item.get('id'): item for item in storage.get_profiles()}
-    for item in sorted(filtered_items, key=lambda record: str((record.get('interview_schedule') or {}).get('submitted_at', '') or record.get('created_at', '')), reverse=True):
+    sorted_items = sorted(filtered_items, key=lambda record: str((record.get('interview_schedule') or {}).get('submitted_at', '') or record.get('created_at', '')), reverse=True)
+    page_schedule, _ = _paginate_items(
+        sorted_items,
+        page_key='schedule_reviews',
+        per_page=20,
+        filter_signature=selected_status,
+    )
+    for item in page_schedule:
         schedule = item.get('interview_schedule', {}) or {}
         profile_name = (profiles_map.get(item.get('profile_id')) or {}).get('name', '') or 'Unknown profile'
         label = f"{_generated_resume_display_title(item)} • {profile_name} • {schedule.get('review_status', 'not_submitted')}"
@@ -2302,11 +2603,16 @@ def user_access_page(user: dict) -> None:
     users = storage.get_users()
     pending_users = [item for item in users if item.get('status') == 'pending']
     approved_users = [item for item in users if item.get('status') == 'approved']
-    pending_tab, approved_tab, metrics_tab, schedule_reviews_tab = st.tabs(['Pending requests', 'Approved users', 'Application metrics', 'Interview schedule reviews'])
+    pending_tab, approved_tab, metrics_tab, schedule_reviews_tab, openai_logs_tab = st.tabs(['Pending requests', 'Approved users', 'Application metrics', 'Interview schedule reviews', 'OpenAI logs'])
     with pending_tab:
         if not pending_users:
             st.info('No pending access requests.')
-        for pending in pending_users:
+        page_pending_users, _ = _paginate_items(
+            pending_users,
+            page_key='user_access_pending',
+            per_page=10,
+        )
+        for pending in page_pending_users:
             with st.expander(f"{pending.get('full_name') or pending.get('username')} • {pending.get('username')}"):
                 available_profiles, owner_map = _available_profiles_for_user_assignment(profiles, users, pending.get('id', ''), pending.get('assigned_profile_ids', []))
                 assigned = st.multiselect(
@@ -2336,7 +2642,12 @@ def user_access_page(user: dict) -> None:
                         st.success('Pending request removed.')
                         st.rerun()
     with approved_tab:
-        for member in approved_users:
+        page_approved_users, _ = _paginate_items(
+            approved_users,
+            page_key='user_access_approved',
+            per_page=10,
+        )
+        for member in page_approved_users:
             with st.expander(f"{member.get('full_name') or member.get('username')} • {'Admin' if member.get('is_admin') else 'User'}"):
                 available_profiles, owner_map = _available_profiles_for_user_assignment(profiles, users, member.get('id', ''), member.get('assigned_profile_ids', []))
                 assigned = st.multiselect(
@@ -2368,6 +2679,9 @@ def user_access_page(user: dict) -> None:
 
     with schedule_reviews_tab:
         _render_schedule_reviews_tab(user)
+
+    with openai_logs_tab:
+        _render_openai_logs_tab()
 
 # ---------- Job list ----------
 
@@ -2505,7 +2819,13 @@ def job_list_page(user: dict) -> None:
                 filtered_jobs.append(job)
         if not filtered_jobs:
             st.info('No approved jobs match your assigned profile markets yet.')
-        for job in filtered_jobs:
+        page_jobs, _ = _paginate_items(
+            filtered_jobs,
+            page_key='job_list_approved',
+            per_page=20,
+            filter_signature=needle,
+        )
+        for job in page_jobs:
             with st.container(border=True):
                 info_col, action_col = st.columns([5.4, 1.2], gap='medium')
                 with info_col:
@@ -2670,7 +2990,12 @@ def job_list_page(user: dict) -> None:
                 st.info('No pending jobs to review.')
             else:
                 st.caption('Pending job edits are grouped in submit forms so typing does not rerender the whole page.')
-            for job in pending_jobs:
+            page_pending, _ = _paginate_items(
+                pending_jobs,
+                page_key='job_list_pending',
+                per_page=20,
+            )
+            for job in page_pending:
                 with st.expander(f"Pending • {_job_summary_label(job)}"):
                     st.caption(f"Source: {job.get('source', 'manual')} • Scrape status: {job.get('scrape_status', 'n/a')}")
                     if job.get('scrape_error'):
@@ -2742,7 +3067,12 @@ def job_list_page(user: dict) -> None:
                 st.info('No reported jobs yet.')
             else:
                 st.caption(f'{len(reported_jobs)} reported job(s). Reports are flagged by users or auto-flagged after repeated low ATS scores.')
-            for job in reported_jobs:
+            page_reported, _ = _paginate_items(
+                reported_jobs,
+                page_key='job_list_reported',
+                per_page=20,
+            )
+            for job in page_reported:
                 reports = job.get('reports', []) or []
                 with st.expander(f"Reported • {_job_summary_label(job)} • {len(reports)} report(s)"):
                     if job.get('link'):
@@ -3064,7 +3394,20 @@ def generated_resumes_page(user: dict) -> None:
         open_items = set(open_items or [])
         st.session_state['generated_resume_open_items'] = open_items
 
-    for index, item in enumerate(reversed(filtered_items), start=1):
+    ordered_items = list(reversed(filtered_items))
+    filter_signature = '|'.join([
+        str(needle), str(selected_company), str(selected_profile),
+        selected_start_str, selected_end_str, selected_date_str,
+    ])
+    page_items, page_start_offset = _paginate_items(
+        ordered_items,
+        page_key='generated_resumes_list',
+        per_page=20,
+        filter_signature=filter_signature,
+    )
+
+    for offset, item in enumerate(page_items, start=1):
+        index = page_start_offset + offset
         created_at = item.get('created_at', '')
         saved_id = item.get('saved_resume_id', '')
         item_key = f"{index}_{created_at}_{saved_id}"

@@ -1,0 +1,215 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TailorResume Companion</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div>
+        <div class="brand">TailorResume</div>
+        <div class="subbrand">Extension Companion</div>
+      </div>
+      <button id="refreshBtn" class="icon-btn" title="Refresh">↻</button>
+    </header>
+
+    <section id="loginView" class="card hidden">
+      <h1 class="section-title">Sign in</h1>
+      <p class="help">Use the same approved account you use in TailorResume.</p>
+      <label class="field">
+        <span>API URL</span>
+        <input id="apiBaseInput" type="url" placeholder="http://127.0.0.1:8010">
+      </label>
+      <label class="field">
+        <span>Username or email</span>
+        <input id="identifierInput" type="text" autocomplete="username">
+      </label>
+      <label class="field">
+        <span>Password</span>
+        <input id="passwordInput" type="password" autocomplete="current-password">
+      </label>
+      <button id="loginBtn" class="primary-btn full">Sign in</button>
+      <div id="loginMessage" class="message"></div>
+    </section>
+
+    <section id="appView" class="hidden">
+      <div class="user-bar card compact">
+        <div>
+          <div id="userName" class="user-name"></div>
+          <div id="userMeta" class="user-meta"></div>
+        </div>
+        <button id="logoutBtn" class="secondary-btn">Sign out</button>
+      </div>
+
+      <nav class="tab-row">
+        <button class="tab-btn active" data-tab="dashboard">Dashboard</button>
+        <button class="tab-btn" data-tab="jobs">Jobs</button>
+        <button class="tab-btn" data-tab="weekly">Weekly</button>
+        <button class="tab-btn" data-tab="resumes">Resumes</button>
+        <button class="tab-btn" data-tab="settings">Settings</button>
+      </nav>
+
+      <main>
+        <section id="tab-dashboard" class="tab-panel active">
+          <div class="grid gap-12">
+            <div class="stats-grid">
+              <div class="stat-card">
+                <div class="stat-label">Open jobs</div>
+                <div id="openJobsCount" class="stat-value">0</div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-label">Saved resumes</div>
+                <div id="savedResumesCount" class="stat-value">0</div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-label">This week</div>
+                <div id="weeklyApplicationsCount" class="stat-value">0</div>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-head inline-between">
+                <h2 class="section-title">Next Job</h2>
+                <button id="nextJobBtn" class="secondary-btn small">Next job</button>
+              </div>
+              <div id="nextJobEmpty" class="empty-state hidden">No open jobs available.</div>
+              <div id="nextJobCard" class="hidden">
+                <div class="job-title" id="nextJobTitle"></div>
+                <div class="job-company" id="nextJobCompany"></div>
+                <div class="job-meta" id="nextJobMeta"></div>
+                <div id="nextJobProfiles" class="pill-row"></div>
+                <div class="button-grid four">
+                  <button id="seeDescriptionBtn" class="secondary-btn">See Job Description</button>
+                  <button id="generateResumeBtn" class="primary-btn">Generate Resume</button>
+                  <button id="reportJobBtn" class="secondary-btn">Report Job</button>
+                  <button id="openLinkBtn" class="secondary-btn">Open Link</button>
+                </div>
+                <div id="jobDescriptionBox" class="description-box hidden"></div>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <h2 class="section-title">Generate Resume</h2>
+              </div>
+              <div class="two-col-grid">
+                <label class="field">
+                  <span>Profile</span>
+                  <select id="profileSelect"></select>
+                </label>
+                <label class="field">
+                  <span>Template</span>
+                  <select id="templateSelect"></select>
+                </label>
+              </div>
+              <label class="field">
+                <span>Custom prompt</span>
+                <textarea id="customPromptInput" rows="3" placeholder="Optional guidance for this resume run"></textarea>
+              </label>
+              <label class="checkbox-row"><input id="useAiInput" type="checkbox" checked> Use OpenAI</label>
+              <div id="generateStatus" class="message"></div>
+              <div id="generateResult" class="hidden result-box">
+                <div id="generateMode" class="small-muted"></div>
+                <div id="generateAts" class="result-ats"></div>
+                <div id="generateHeadline" class="result-headline"></div>
+                <div class="button-grid two">
+                  <button id="downloadResumeBtn" class="primary-btn">Download Resume</button>
+                  <button id="viewSavedResumeBtn" class="secondary-btn">View Saved Resume</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section id="tab-jobs" class="tab-panel">
+          <div class="card">
+            <div class="card-head inline-between">
+              <h2 class="section-title">Browse Jobs</h2>
+              <label class="checkbox-row compact"><input id="onlyOpenJobsInput" type="checkbox" checked> Only open</label>
+            </div>
+            <label class="field compact">
+              <span>Search</span>
+              <input id="jobSearchInput" type="text" placeholder="Company, title, notes">
+            </label>
+            <div id="jobsList" class="list-stack"></div>
+          </div>
+        </section>
+
+        <section id="tab-weekly" class="tab-panel">
+          <div class="card">
+            <div class="card-head inline-between">
+              <h2 class="section-title">Weekly Report</h2>
+              <input id="weekStartInput" type="date" class="date-input">
+            </div>
+            <div class="stats-grid compact-stats">
+              <div class="stat-card"><div class="stat-label">Applications</div><div id="weeklyTotalApplications" class="stat-value">0</div></div>
+              <div class="stat-card"><div class="stat-label">Schedules</div><div id="weeklyTotalSchedules" class="stat-value">0</div></div>
+            </div>
+            <div id="weeklyDays" class="week-grid"></div>
+            <div class="subsection-title">Recent applications</div>
+            <div id="recentApplications" class="list-stack"></div>
+          </div>
+        </section>
+
+        <section id="tab-resumes" class="tab-panel">
+          <div class="card">
+            <div class="card-head inline-between">
+              <h2 class="section-title">Saved Resumes</h2>
+              <button id="loadResumesBtn" class="secondary-btn small">Refresh</button>
+            </div>
+            <div id="resumesList" class="list-stack"></div>
+          </div>
+        </section>
+
+        <section id="tab-settings" class="tab-panel">
+          <div class="card">
+            <h2 class="section-title">Settings</h2>
+            <label class="field">
+              <span>API URL</span>
+              <input id="settingsApiBaseInput" type="url" placeholder="http://127.0.0.1:8010">
+            </label>
+            <button id="saveSettingsBtn" class="primary-btn">Save Settings</button>
+            <div id="settingsMessage" class="message"></div>
+            <div class="subsection-title">Current page</div>
+            <div id="currentPageInfo" class="small-muted"></div>
+          </div>
+        </section>
+      </main>
+    </section>
+  </div>
+
+  <dialog id="reportDialog" class="dialog">
+    <form id="reportForm" method="dialog">
+      <div class="card-head inline-between">
+        <h2 class="section-title">Report Job</h2>
+        <button class="icon-btn" value="cancel">✕</button>
+      </div>
+      <label class="field"><span>Reason</span><input id="reportReason" type="text" required></label>
+      <label class="field"><span>Company</span><input id="reportCompany" type="text"></label>
+      <label class="field"><span>Job title</span><input id="reportTitle" type="text"></label>
+      <label class="field"><span>Link</span><input id="reportLink" type="url"></label>
+      <label class="field"><span>Description</span><textarea id="reportDescription" rows="4"></textarea></label>
+      <label class="field"><span>Note</span><textarea id="reportNote" rows="2"></textarea></label>
+      <label class="field"><span>Region</span>
+        <select id="reportRegion">
+          <option value="US">US</option>
+          <option value="EU">EU</option>
+          <option value="LATAM">LATAM</option>
+          <option value="Any">Any</option>
+        </select>
+      </label>
+      <div id="reportMessage" class="message"></div>
+      <div class="button-grid two">
+        <button id="submitReportBtn" class="primary-btn" value="default">Submit</button>
+        <button class="secondary-btn" value="cancel">Cancel</button>
+      </div>
+    </form>
+  </dialog>
+
+    <script src="config.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

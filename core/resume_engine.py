@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
+import time
+import uuid
 from collections import Counter
 from copy import deepcopy
 from typing import Iterable
@@ -10,6 +13,311 @@ from typing import Iterable
 from dotenv import load_dotenv
 
 load_dotenv()
+
+
+class OpenAITraceError(Exception):
+    def __init__(self, message: str, trace: dict):
+        super().__init__(message)
+        self.trace = trace
+
+
+OPENAI_PRICING_ENV_SUFFIX = {
+    'input': 'INPUT_PER_1M',
+    'output': 'OUTPUT_PER_1M',
+    'cached_input': 'CACHED_INPUT_PER_1M',
+    'reasoning_output': 'REASONING_OUTPUT_PER_1M',
+}
+
+
+def _make_flow_id(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex[:12]}"
+
+
+def _safe_int(value, default: int = 0) -> int:
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except Exception:
+        return default
+
+
+def _safe_float(value, default: float | None = None) -> float | None:
+    try:
+        if value in (None, ''):
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _estimate_tokens_from_text(text: str) -> int:
+    raw = str(text or '')
+    if not raw:
+        return 0
+    return max(1, math.ceil(len(raw) / 4))
+
+
+def _estimate_tokens_from_payload(payload: dict) -> int:
+    try:
+        return _estimate_tokens_from_text(json.dumps(payload, ensure_ascii=False))
+    except Exception:
+        return 0
+
+
+def _model_env_key(model: str, suffix: str) -> str:
+    cleaned = re.sub(r'[^A-Z0-9]+', '_', str(model or '').upper()).strip('_')
+    return f"OPENAI_PRICE_{cleaned}_{suffix}"
+
+
+def _pricing_value_for_model(model: str, kind: str) -> tuple[float | None, str | None]:
+    suffix = OPENAI_PRICING_ENV_SUFFIX.get(kind, '')
+    if not suffix:
+        return None, None
+    specific_key = _model_env_key(model, suffix)
+    specific_value = _safe_float(os.getenv(specific_key, '').strip(), None)
+    if specific_value is not None:
+        return specific_value, specific_key
+    generic_key = f"OPENAI_PRICE_{suffix}"
+    generic_value = _safe_float(os.getenv(generic_key, '').strip(), None)
+    if generic_value is not None:
+        return generic_value, generic_key
+    return None, None
+
+
+def _extract_response_usage(response) -> dict:
+    usage_obj = getattr(response, 'usage', None)
+    if usage_obj is None and isinstance(response, dict):
+        usage_obj = response.get('usage')
+
+    def _read(obj, *keys, default=0):
+        current = obj
+        for key in keys:
+            if current is None:
+                return default
+            if isinstance(current, dict):
+                current = current.get(key)
+            else:
+                current = getattr(current, key, None)
+        if current is None:
+            return default
+        return _safe_int(current, default)
+
+    input_tokens = _read(usage_obj, 'input_tokens', default=0)
+    output_tokens = _read(usage_obj, 'output_tokens', default=0)
+    total_tokens = _read(usage_obj, 'total_tokens', default=input_tokens + output_tokens)
+    cached_tokens = _read(usage_obj, 'input_tokens_details', 'cached_tokens', default=0)
+    reasoning_tokens = _read(usage_obj, 'output_tokens_details', 'reasoning_tokens', default=0)
+
+    usage = {
+        'input_tokens': input_tokens,
+        'output_tokens': output_tokens,
+        'total_tokens': total_tokens or (input_tokens + output_tokens),
+        'cached_input_tokens': cached_tokens,
+        'reasoning_output_tokens': reasoning_tokens,
+    }
+    usage['billable_input_tokens'] = max(0, usage['input_tokens'] - usage['cached_input_tokens'])
+    return usage
+
+
+def _estimate_usage_cost(usage: dict, model: str) -> dict:
+    input_price, input_price_source = _pricing_value_for_model(model, 'input')
+    output_price, output_price_source = _pricing_value_for_model(model, 'output')
+    cached_price, cached_price_source = _pricing_value_for_model(model, 'cached_input')
+    reasoning_price, reasoning_price_source = _pricing_value_for_model(model, 'reasoning_output')
+
+    billable_input_tokens = _safe_int((usage or {}).get('billable_input_tokens', 0))
+    cached_input_tokens = _safe_int((usage or {}).get('cached_input_tokens', 0))
+    output_tokens = _safe_int((usage or {}).get('output_tokens', 0))
+    reasoning_output_tokens = _safe_int((usage or {}).get('reasoning_output_tokens', 0))
+
+    regular_output_tokens = max(0, output_tokens - reasoning_output_tokens)
+
+    input_cost = None if input_price is None else round((billable_input_tokens / 1_000_000) * input_price, 8)
+    cached_cost = None if cached_price is None else round((cached_input_tokens / 1_000_000) * cached_price, 8)
+    output_cost = None if output_price is None else round((regular_output_tokens / 1_000_000) * output_price, 8)
+    reasoning_cost = None if reasoning_price is None else round((reasoning_output_tokens / 1_000_000) * reasoning_price, 8)
+
+    present_costs = [value for value in (input_cost, cached_cost, output_cost, reasoning_cost) if value is not None]
+    total_cost = round(sum(present_costs), 8) if present_costs else None
+
+    return {
+        'input_cost_usd': input_cost,
+        'cached_input_cost_usd': cached_cost,
+        'output_cost_usd': output_cost,
+        'reasoning_output_cost_usd': reasoning_cost,
+        'total_cost_usd': total_cost,
+        'pricing_source': {
+            'input': input_price_source or '',
+            'cached_input': cached_price_source or '',
+            'output': output_price_source or '',
+            'reasoning_output': reasoning_price_source or '',
+        },
+    }
+
+
+def _profile_generation_summary(profile: dict) -> dict:
+    clean = _profile_for_generation(profile)
+    work_history = clean.get('work_history', []) or []
+    education_history = clean.get('education_history', []) or []
+    bullets = sum(len((item or {}).get('bullets', []) or []) for item in work_history)
+    return {
+        'profile_name': str(clean.get('name', '')).strip(),
+        'technical_skill_count': len(clean.get('technical_skills', []) or []),
+        'work_history_count': len(work_history),
+        'work_history_bullet_count': bullets,
+        'education_count': len(education_history),
+    }
+
+
+def _payload_summary_for_trace(payload: dict) -> dict:
+    summary = {
+        'payload_bytes': len(json.dumps(payload, ensure_ascii=False).encode('utf-8')),
+        'payload_chars': len(json.dumps(payload, ensure_ascii=False)),
+        'payload_estimated_tokens': _estimate_tokens_from_payload(payload),
+        'job_description_chars': len(str((payload or {}).get('job_description', '') or '')),
+        'default_prompt_chars': len(str((payload or {}).get('default_prompt', '') or '')),
+        'custom_prompt_chars': len(str((payload or {}).get('custom_prompt', '') or '')),
+        'effective_prompt_chars': len(str((payload or {}).get('effective_prompt', '') or '')),
+        'target_role_chars': len(str((payload or {}).get('target_role', '') or '')),
+        'validation_feedback_chars': len(str((payload or {}).get('validation_feedback', '') or '')),
+        'fix_prompt_chars': len(str((payload or {}).get('fix_prompt', '') or '')),
+        'question_count': len((payload or {}).get('questions', []) or []),
+        'profile': _profile_generation_summary((payload or {}).get('profile', {}) or {}),
+        'job_tech_keywords_count': len((((payload or {}).get('job_tech_analysis', {}) or {}).get('keywords', []) or []),),
+    }
+    job_tech_analysis = (payload or {}).get('job_tech_analysis', {}) or {}
+    summary['job_tech_keywords_count'] = len(job_tech_analysis.get('keywords', []) or [])
+    summary['job_tech_expanded_count'] = len(job_tech_analysis.get('expanded_techs', []) or [])
+    summary['bullet_target_company_count'] = len((payload or {}).get('bullet_targets_per_company', []) or [])
+    current_resume = (payload or {}).get('current_resume', {}) or {}
+    summary['current_resume_work_history_count'] = len(current_resume.get('work_history', []) or [])
+    summary['current_resume_skill_count'] = len(current_resume.get('technical_skills', []) or [])
+    return summary
+
+
+
+
+def _truncate_trace_text(text: str, limit: int = 120000) -> tuple[str, bool]:
+    raw = str(text or '')
+    if len(raw) <= limit:
+        return raw, False
+    return raw[:limit], True
+
+
+def _response_text_for_trace(response, parsed: dict | None = None) -> tuple[str, str, bool, bool]:
+    raw_text = '' if response is None else str(getattr(response, 'output_text', '') or '')
+    if not raw_text and parsed is not None:
+        try:
+            raw_text = json.dumps(parsed, ensure_ascii=False)
+        except Exception:
+            raw_text = str(parsed)
+    pretty_text = ''
+    if parsed is not None:
+        try:
+            pretty_text = json.dumps(parsed, ensure_ascii=False, indent=2)
+        except Exception:
+            pretty_text = str(parsed)
+    elif raw_text:
+        try:
+            pretty_text = json.dumps(json.loads(raw_text), ensure_ascii=False, indent=2)
+        except Exception:
+            pretty_text = raw_text
+    output_text, output_text_truncated = _truncate_trace_text(raw_text)
+    output_pretty, output_pretty_truncated = _truncate_trace_text(pretty_text)
+    return output_text, output_pretty, output_text_truncated, output_pretty_truncated
+
+def _build_api_trace(*, flow_id: str, call_kind: str, model: str, schema_name: str, developer_message: str, payload: dict, duration_ms: int, status: str, response=None, error: str = '', attempt: int | None = None, parsed: dict | None = None) -> dict:
+    usage = _extract_response_usage(response) if response is not None else {
+        'input_tokens': 0,
+        'output_tokens': 0,
+        'total_tokens': 0,
+        'cached_input_tokens': 0,
+        'reasoning_output_tokens': 0,
+        'billable_input_tokens': 0,
+    }
+    cost = _estimate_usage_cost(usage, model)
+    developer_chars = len(str(developer_message or ''))
+    payload_summary = _payload_summary_for_trace(payload)
+    local_input_estimate = _estimate_tokens_from_text(str(developer_message or '')) + payload_summary.get('payload_estimated_tokens', 0)
+    output_text, output_pretty, output_text_truncated, output_pretty_truncated = _response_text_for_trace(response, parsed=parsed)
+    trace = {
+        'flow_id': flow_id,
+        'call_kind': call_kind,
+        'attempt': _safe_int(attempt, 0),
+        'status': status,
+        'model': str(model or '').strip(),
+        'schema_name': str(schema_name or '').strip(),
+        'response_id': '' if response is None else str(getattr(response, 'id', '') or ''),
+        'duration_ms': _safe_int(duration_ms, 0),
+        'developer_message_chars': developer_chars,
+        'input_estimated_tokens_local': local_input_estimate,
+        'output_text_chars': len(output_text),
+        'output_estimated_tokens_local': _estimate_tokens_from_text(output_text),
+        'output_text': output_text,
+        'output_text_truncated': output_text_truncated,
+        'output_pretty': output_pretty,
+        'output_pretty_truncated': output_pretty_truncated,
+        'usage': usage,
+        'cost': cost,
+        'payload_summary': payload_summary,
+        'error': str(error or '').strip(),
+    }
+    return trace
+
+
+def _openai_json_schema_call(*, client, model: str, developer_message: str, payload: dict, schema_name: str, schema: dict, flow_id: str, call_kind: str, attempt: int | None = None) -> tuple[dict, dict]:
+    input_messages = [
+        {'role': 'developer', 'content': developer_message},
+        {'role': 'user', 'content': json.dumps(payload, ensure_ascii=False)},
+    ]
+    started = time.perf_counter()
+    try:
+        response = client.responses.create(
+            model=model,
+            input=input_messages,
+            text={
+                'format': {
+                    'type': 'json_schema',
+                    'name': schema_name,
+                    'strict': True,
+                    'schema': schema,
+                }
+            },
+        )
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        parsed = json.loads(str(getattr(response, 'output_text', '') or ''))
+        trace = _build_api_trace(
+            flow_id=flow_id,
+            call_kind=call_kind,
+            model=model,
+            schema_name=schema_name,
+            developer_message=developer_message,
+            payload=payload,
+            duration_ms=duration_ms,
+            status='success',
+            response=response,
+            attempt=attempt,
+            parsed=parsed,
+        )
+        return parsed, trace
+    except Exception as exc:
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        trace = _build_api_trace(
+            flow_id=flow_id,
+            call_kind=call_kind,
+            model=model,
+            schema_name=schema_name,
+            developer_message=developer_message,
+            payload=payload,
+            duration_ms=duration_ms,
+            status='error',
+            response=None,
+            error=str(exc),
+            attempt=attempt,
+        )
+        raise OpenAITraceError(str(exc), trace) from exc
+
 
 CATEGORY_ALIASES = {
     'Frontend': [
@@ -169,7 +477,6 @@ RESUME_SCHEMA = {
     'properties': {
         'headline': {'type': 'string'},
         'summary': {'type': 'string'},
-        'technical_skills': {'type': 'array', 'items': {'type': 'string'}},
         'skill_groups': {
             'type': 'array',
             'items': {
@@ -182,39 +489,21 @@ RESUME_SCHEMA = {
                 'required': ['category', 'items'],
             },
         },
-        'fit_keywords': {'type': 'array', 'items': {'type': 'string'}},
         'work_history': {
             'type': 'array',
             'items': {
                 'type': 'object',
                 'additionalProperties': False,
                 'properties': {
-                    'company_name': {'type': 'string'},
+                    'company_index': {'type': 'integer'},
                     'role_title': {'type': 'string'},
-                    'role_headline': {'type': 'string'},
-                    'duration': {'type': 'string'},
-                    'location': {'type': 'string'},
                     'bullets': {'type': 'array', 'items': {'type': 'string'}},
                 },
-                'required': ['company_name', 'role_title', 'role_headline', 'duration', 'location', 'bullets'],
-            },
-        },
-        'education_history': {
-            'type': 'array',
-            'items': {
-                'type': 'object',
-                'additionalProperties': False,
-                'properties': {
-                    'university': {'type': 'string'},
-                    'degree': {'type': 'string'},
-                    'duration': {'type': 'string'},
-                    'location': {'type': 'string'},
-                },
-                'required': ['university', 'degree', 'duration', 'location'],
+                'required': ['company_index', 'role_title', 'bullets'],
             },
         },
     },
-    'required': ['headline', 'summary', 'technical_skills', 'skill_groups', 'fit_keywords', 'work_history', 'education_history'],
+    'required': ['headline', 'summary', 'skill_groups', 'work_history'],
 }
 
 
@@ -230,6 +519,8 @@ def generate_resume_content(
     job_tech_analysis = _analyze_job_tech_stack(job_description, target_role=target_role)
     api_key = os.getenv('OPENAI_API_KEY', '').strip()
     attempts = []
+    api_logs: list[dict] = []
+    flow_id = _make_flow_id('resume_generate')
 
     def _attempt_feedback(reason: str, validation: dict | None = None) -> str:
         parts = [reason.strip()]
@@ -247,7 +538,7 @@ def generate_resume_content(
         feedback = ''
         for attempt in range(1, 4):
             try:
-                resume = _generate_with_openai(
+                call_result = _generate_with_openai(
                     profile=profile,
                     job_description=job_description,
                     target_role=target_role,
@@ -256,14 +547,24 @@ def generate_resume_content(
                     clean_generation=clean_generation,
                     job_tech_analysis=job_tech_analysis,
                     validation_feedback=feedback,
+                    flow_id=flow_id,
+                    attempt=attempt,
                 )
+                resume = call_result['resume']
+                api_logs.append(call_result['api_log'])
                 validation = _resume_meets_generation_requirements(resume, job_tech_analysis)
                 attempts.append({'attempt': attempt, 'validation': validation})
+                api_logs[-1]['post_validation'] = validation
                 if validation.get('ok'):
                     if attempt > 1:
                         resume['generation_note'] = f'OpenAI generation passed after {attempt} attempts.'
-                    return {'mode': 'openai', 'resume': resume, 'job_tech_analysis': job_tech_analysis, 'attempts': attempts}
+                    return {'mode': 'openai', 'resume': resume, 'job_tech_analysis': job_tech_analysis, 'attempts': attempts, 'api_logs': api_logs, 'flow_id': flow_id}
                 feedback = _attempt_feedback('Regenerate the full resume and fix the validation failures exactly.', validation)
+            except OpenAITraceError as exc:  # pragma: no cover
+                last_exc = exc
+                if getattr(exc, 'trace', None):
+                    api_logs.append(exc.trace)
+                break
             except Exception as exc:  # pragma: no cover
                 last_exc = exc
                 break
@@ -277,7 +578,7 @@ def generate_resume_content(
             job_tech_analysis=job_tech_analysis,
         )
         resume['generation_note'] = f'Fell back to demo mode because OpenAI request failed or did not satisfy generation checks: {last_exc or feedback}'
-        return {'mode': 'demo-fallback', 'resume': resume, 'job_tech_analysis': job_tech_analysis, 'attempts': attempts}
+        return {'mode': 'demo-fallback', 'resume': resume, 'job_tech_analysis': job_tech_analysis, 'attempts': attempts, 'api_logs': api_logs, 'flow_id': flow_id}
 
     resume = _generate_demo_resume(
         profile=profile,
@@ -288,8 +589,7 @@ def generate_resume_content(
         clean_generation=clean_generation,
         job_tech_analysis=job_tech_analysis,
     )
-    return {'mode': 'demo', 'resume': resume, 'job_tech_analysis': job_tech_analysis, 'attempts': attempts}
-
+    return {'mode': 'demo', 'resume': resume, 'job_tech_analysis': job_tech_analysis, 'attempts': attempts, 'api_logs': api_logs, 'flow_id': flow_id}
 
 
 def update_resume_content(
@@ -302,12 +602,15 @@ def update_resume_content(
     default_prompt: str = '',
     use_ai: bool = True,
     clean_generation: bool = True,
+    flow_id: str | None = None,
 ) -> dict:
     current_resume = deepcopy(current_resume or {})
     api_key = os.getenv('OPENAI_API_KEY', '').strip()
+    api_logs: list[dict] = []
+    effective_flow_id = flow_id or _make_flow_id('resume_update')
     if use_ai and api_key:
         try:
-            resume = _update_with_openai(
+            call_result = _update_with_openai(
                 profile=profile,
                 job_description=job_description,
                 current_resume=current_resume,
@@ -316,8 +619,22 @@ def update_resume_content(
                 custom_prompt=custom_prompt,
                 default_prompt=default_prompt,
                 clean_generation=clean_generation,
+                flow_id=effective_flow_id,
             )
-            return {'mode': 'openai-update', 'resume': resume}
+            api_logs.append(call_result['api_log'])
+            return {'mode': 'openai-update', 'resume': call_result['resume'], 'api_logs': api_logs, 'flow_id': effective_flow_id}
+        except OpenAITraceError as exc:  # pragma: no cover
+            if getattr(exc, 'trace', None):
+                api_logs.append(exc.trace)
+            resume = _update_demo_resume(
+                profile=profile,
+                job_description=job_description,
+                current_resume=current_resume,
+                fix_prompt=fix_prompt,
+                target_role=target_role,
+            )
+            resume['generation_note'] = f'Fell back to demo update because OpenAI request failed: {exc}'
+            return {'mode': 'demo-update-fallback', 'resume': resume, 'api_logs': api_logs, 'flow_id': effective_flow_id}
         except Exception as exc:  # pragma: no cover
             resume = _update_demo_resume(
                 profile=profile,
@@ -327,7 +644,7 @@ def update_resume_content(
                 target_role=target_role,
             )
             resume['generation_note'] = f'Fell back to demo update because OpenAI request failed: {exc}'
-            return {'mode': 'demo-update-fallback', 'resume': resume}
+            return {'mode': 'demo-update-fallback', 'resume': resume, 'api_logs': api_logs, 'flow_id': effective_flow_id}
 
     return {
         'mode': 'demo-update',
@@ -338,8 +655,9 @@ def update_resume_content(
             fix_prompt=fix_prompt,
             target_role=target_role,
         ),
+        'api_logs': api_logs,
+        'flow_id': effective_flow_id,
     }
-
 
 
 def improve_resume_to_target_ats(
@@ -357,6 +675,8 @@ def improve_resume_to_target_ats(
 ) -> dict:
     working_resume = deepcopy(current_resume or {})
     history: list[dict] = []
+    api_logs: list[dict] = []
+    flow_id = _make_flow_id('ats_improve')
     best_resume = deepcopy(working_resume)
     best_analysis = analyze_ats_score(best_resume, job_description, target_role=target_role)
 
@@ -366,6 +686,8 @@ def improve_resume_to_target_ats(
             'resume': best_resume,
             'history': history,
             'final_analysis': best_analysis,
+            'api_logs': api_logs,
+            'flow_id': flow_id,
         }
 
     latest_mode = 'ats-auto-improve'
@@ -387,8 +709,10 @@ def improve_resume_to_target_ats(
             default_prompt=default_prompt,
             use_ai=use_ai,
             clean_generation=clean_generation,
+            flow_id=flow_id,
         )
         latest_mode = update_result.get('mode', latest_mode)
+        api_logs.extend(update_result.get('api_logs', []) or [])
         candidate_resume = deepcopy(update_result.get('resume') or working_resume)
         after_analysis = analyze_ats_score(candidate_resume, job_description, target_role=target_role)
 
@@ -416,6 +740,8 @@ def improve_resume_to_target_ats(
         'resume': best_resume,
         'history': history,
         'final_analysis': best_analysis,
+        'api_logs': api_logs,
+        'flow_id': flow_id,
     }
 
 
@@ -602,23 +928,29 @@ def generate_application_answers(
 ) -> dict:
     clean_questions = [str(question).strip() for question in questions if str(question).strip()]
     if not clean_questions:
-        return {'mode': 'empty', 'answers': []}
+        return {'mode': 'empty', 'answers': [], 'api_logs': [], 'flow_id': _make_flow_id('application_answers')}
 
     api_key = os.getenv('OPENAI_API_KEY', '').strip()
+    flow_id = _make_flow_id('application_answers')
     if use_ai and api_key:
         try:
-            return {'mode': 'openai', 'answers': _generate_answers_with_openai(resume, job_description, clean_questions, target_role)}
+            call_result = _generate_answers_with_openai(resume, job_description, clean_questions, target_role, flow_id=flow_id)
+            return {'mode': 'openai', 'answers': call_result['answers'], 'api_logs': [call_result['api_log']], 'flow_id': flow_id}
+        except OpenAITraceError as exc:  # pragma: no cover
+            answers = _generate_demo_answers(resume, job_description, clean_questions, target_role)
+            for item in answers:
+                item['note'] = f'Fell back to demo mode because OpenAI request failed: {exc}'
+            return {'mode': 'demo-fallback', 'answers': answers, 'api_logs': [exc.trace] if getattr(exc, 'trace', None) else [], 'flow_id': flow_id}
         except Exception as exc:  # pragma: no cover
             answers = _generate_demo_answers(resume, job_description, clean_questions, target_role)
             for item in answers:
                 item['note'] = f'Fell back to demo mode because OpenAI request failed: {exc}'
-            return {'mode': 'demo-fallback', 'answers': answers}
+            return {'mode': 'demo-fallback', 'answers': answers, 'api_logs': [], 'flow_id': flow_id}
 
-    return {'mode': 'demo', 'answers': _generate_demo_answers(resume, job_description, clean_questions, target_role)}
+    return {'mode': 'demo', 'answers': _generate_demo_answers(resume, job_description, clean_questions, target_role), 'api_logs': [], 'flow_id': flow_id}
 
 
-
-def _generate_with_openai(profile: dict, job_description: str, target_role: str, custom_prompt: str, default_prompt: str, clean_generation: bool, job_tech_analysis: dict | None = None, validation_feedback: str = '') -> dict:
+def _generate_with_openai(profile: dict, job_description: str, target_role: str, custom_prompt: str, default_prompt: str, clean_generation: bool, job_tech_analysis: dict | None = None, validation_feedback: str = '', flow_id: str = '', attempt: int = 1) -> dict:
     from openai import OpenAI
 
     client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
@@ -649,7 +981,7 @@ def _generate_with_openai(profile: dict, job_description: str, target_role: str,
         'Forbidden generic openings or filler include: "Delivered production work across", "Collaborated with product and engineering stakeholders", "Strengthened reliability and delivery confidence", "Contributed as a ... in a fast-moving environment", "modern tools", "backend services", "cloud-based systems", "web technologies", and any sentence whose only technical content is a comma-separated tech list. '
         'Vary verbs across bullets (own, design, ship, build, migrate, harden, instrument, refactor, mentor, lead, automate, optimize, integrate, debug, profile, partner). '
         'If validation feedback is provided, fix every issue and regenerate the full resume so it passes the validation requirements. '
-        'Return only JSON that matches the schema.'
+        'Return only JSON that matches the schema. Each work_history item must reference the source company only by company_index (0-based), not by company_name, duration, or location because those are filled locally by the app.'
     )
 
     payload = {
@@ -668,28 +1000,25 @@ def _generate_with_openai(profile: dict, job_description: str, target_role: str,
         ],
     }
 
-    response = client.responses.create(
+    content, api_log = _openai_json_schema_call(
+        client=client,
         model=model,
-        input=[
-            {'role': 'developer', 'content': developer_message},
-            {'role': 'user', 'content': json.dumps(payload)},
-        ],
-        text={
-            'format': {
-                'type': 'json_schema',
-                'name': 'tailored_resume_v8',
-                'strict': True,
-                'schema': RESUME_SCHEMA,
-            }
-        },
+        developer_message=developer_message,
+        payload=payload,
+        schema_name='tailored_resume_v9_slim',
+        schema=RESUME_SCHEMA,
+        flow_id=flow_id or _make_flow_id('resume_generate'),
+        call_kind='generate_resume',
+        attempt=attempt,
     )
 
-    content = json.loads(response.output_text)
-    return _normalize_resume(content, profile=profile, target_role=target_role, job_description=job_description)
+    return {
+        'resume': _normalize_resume(content, profile=profile, target_role=target_role, job_description=job_description),
+        'api_log': api_log,
+    }
 
 
-
-def _update_with_openai(profile: dict, job_description: str, current_resume: dict, fix_prompt: str, target_role: str, custom_prompt: str, default_prompt: str, clean_generation: bool) -> dict:
+def _update_with_openai(profile: dict, job_description: str, current_resume: dict, fix_prompt: str, target_role: str, custom_prompt: str, default_prompt: str, clean_generation: bool, flow_id: str = '') -> dict:
     from openai import OpenAI
 
     client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
@@ -734,29 +1063,23 @@ def _update_with_openai(profile: dict, job_description: str, current_resume: dic
         ],
     }
 
-    response = client.responses.create(
+    content, api_log = _openai_json_schema_call(
+        client=client,
         model=model,
-        input=[
-            {'role': 'developer', 'content': developer_message},
-            {'role': 'user', 'content': json.dumps(payload)},
-        ],
-        text={
-            'format': {
-                'type': 'json_schema',
-                'name': 'tailored_resume_update_v8',
-                'strict': True,
-                'schema': RESUME_SCHEMA,
-            }
-        },
+        developer_message=developer_message,
+        payload=payload,
+        schema_name='tailored_resume_update_v9_slim',
+        schema=RESUME_SCHEMA,
+        flow_id=flow_id or _make_flow_id('resume_update'),
+        call_kind='update_resume',
+        attempt=1,
     )
 
-    content = json.loads(response.output_text)
     updated = _normalize_resume(content, profile=profile, target_role=target_role, job_description=job_description)
     for key in ('bold_keywords', 'auto_bold_fit_keywords'):
         if key in current_resume:
             updated[key] = current_resume[key]
-    return updated
-
+    return {'resume': updated, 'api_log': api_log}
 
 
 def _generate_demo_resume(profile: dict, job_description: str, target_role: str, custom_prompt: str, default_prompt: str = '', clean_generation: bool = True, job_tech_analysis: dict | None = None) -> dict:
@@ -838,7 +1161,7 @@ def _update_demo_resume(profile: dict, job_description: str, current_resume: dic
     return _normalize_resume(updated, profile=profile, target_role=inferred_title, job_description=job_description)
 
 
-def _generate_answers_with_openai(resume: dict, job_description: str, questions: list[str], target_role: str = '') -> list[dict]:
+def _generate_answers_with_openai(resume: dict, job_description: str, questions: list[str], target_role: str = '', flow_id: str = '') -> dict:
     from openai import OpenAI
 
     client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
@@ -863,24 +1186,19 @@ def _generate_answers_with_openai(resume: dict, job_description: str, questions:
         'questions': questions,
     }
 
-    response = client.responses.create(
+    content, api_log = _openai_json_schema_call(
+        client=client,
         model=model,
-        input=[
-            {'role': 'developer', 'content': developer_message},
-            {'role': 'user', 'content': json.dumps(payload)},
-        ],
-        text={
-            'format': {
-                'type': 'json_schema',
-                'name': 'job_application_answers_v1',
-                'strict': True,
-                'schema': APPLICATION_ANSWER_SCHEMA,
-            }
-        },
+        developer_message=developer_message,
+        payload=payload,
+        schema_name='job_application_answers_v1',
+        schema=APPLICATION_ANSWER_SCHEMA,
+        flow_id=flow_id or _make_flow_id('application_answers'),
+        call_kind='application_answers',
+        attempt=1,
     )
 
-    content = json.loads(response.output_text)
-    return [
+    answers = [
         {
             'question': str(item.get('question', '')).strip(),
             'answer': str(item.get('answer', '')).strip(),
@@ -888,6 +1206,7 @@ def _generate_answers_with_openai(resume: dict, job_description: str, questions:
         for item in content.get('answers', [])
         if str(item.get('question', '')).strip() and str(item.get('answer', '')).strip()
     ]
+    return {'answers': answers, 'api_log': api_log}
 
 
 def _generate_demo_answers(resume: dict, job_description: str, questions: list[str], target_role: str = '') -> list[dict]:
@@ -966,16 +1285,37 @@ def _profile_for_generation(profile: dict) -> dict:
 
 def _normalize_resume(resume: dict, profile: dict, target_role: str, job_description: str) -> dict:
     source_history = profile.get('work_history', [])
-    generated = resume.get('work_history') or []
+    generated_items = resume.get('work_history') or []
     tech_analysis = _analyze_job_tech_stack(job_description, target_role=target_role)
     extracted = tech_analysis.get('keywords', [])
     expanded_stack = tech_analysis.get('expanded_techs', [])
     inferred_title = _infer_target_title(target_role, extracted, profile.get('technical_skills', []) + expanded_stack)
+
+    generated_by_index: dict[int, dict] = {}
+    ordered_generated: list[dict] = []
+    for idx, item in enumerate(generated_items):
+        if not isinstance(item, dict):
+            continue
+        company_index = item.get('company_index')
+        try:
+            company_index = int(company_index)
+        except Exception:
+            company_index = idx
+        if company_index < 0:
+            company_index = idx
+        clean_item = {
+            'company_index': company_index,
+            'role_title': str(item.get('role_title', '')).strip(),
+            'bullets': [str(b).strip() for b in item.get('bullets', []) if str(b).strip()],
+        }
+        generated_by_index[company_index] = clean_item
+        ordered_generated.append(clean_item)
+
     normalized_history = []
     total_jobs = len(source_history)
     seen_bullet_keys: set[str] = set()
     for index, source_job in enumerate(source_history):
-        item = generated[index] if index < len(generated) else {}
+        item = generated_by_index.get(index) or (ordered_generated[index] if index < len(ordered_generated) else {})
         bullets = _dedupe_bullets(item.get('bullets', source_job.get('bullets', [])))
         bullets = [b for b in bullets if b.lower().rstrip('.') not in seen_bullet_keys]
         target = _target_bullet_count(index, total_jobs)
@@ -989,39 +1329,33 @@ def _normalize_resume(resume: dict, profile: dict, target_role: str, job_descrip
         for bullet in bullets:
             seen_bullet_keys.add(bullet.lower().rstrip('.'))
         normalized_history.append({
-            'company_name': item.get('company_name') or source_job.get('company_name', ''),
+            'company_name': source_job.get('company_name', ''),
             'role_title': item.get('role_title') or _company_role_title(inferred_title, index),
-            'role_headline': item.get('role_headline') or '',
-            'duration': item.get('duration') or source_job.get('duration', ''),
-            'location': item.get('location') or source_job.get('location', ''),
+            'role_headline': '',
+            'duration': source_job.get('duration', ''),
+            'location': source_job.get('location', ''),
             'bullets': bullets,
         })
 
-    flat_skills = _dedupe_preserve_order(resume.get('technical_skills', []))
-    grouped_input_items = [item for group in resume.get('skill_groups', []) or [] for item in group.get('items', [])]
-    flat_skills = _dedupe_preserve_order(flat_skills + grouped_input_items)
-    technical_skills = _ensure_tech_range(flat_skills, expanded_stack, minimum=40, maximum=50)
-
     generated_groups = _normalize_skill_groups(resume.get('skill_groups', []))
-    if not generated_groups:
-        generated_groups = _group_skills_for_resume(technical_skills, extracted)
-    else:
-        generated_groups = _group_skills_for_resume(technical_skills, extracted)
+    grouped_input_items = [item for group in generated_groups for item in group.get('items', [])]
+    grouped_input_items = [item for item in grouped_input_items if _is_technical_stack_item(item)]
+    technical_skills = _ensure_tech_range(_dedupe_preserve_order(grouped_input_items), expanded_stack, minimum=40, maximum=50)
+    generated_groups = _group_skills_for_resume(technical_skills, extracted)
 
     normalized = {
         'headline': resume.get('headline') or _infer_resume_headline(inferred_title, technical_skills),
         'summary': resume.get('summary') or _build_summary(profile, inferred_title, technical_skills, ''),
         'technical_skills': technical_skills,
         'skill_groups': generated_groups,
-        'fit_keywords': _dedupe_preserve_order([item for item in resume.get('fit_keywords', []) if str(item).strip()] + extracted)[:18],
+        'fit_keywords': extracted[:18],
         'work_history': normalized_history,
-        'education_history': resume.get('education_history', profile.get('education_history', [])),
+        'education_history': profile.get('education_history', []),
     }
     for optional_key in ('bold_keywords', 'auto_bold_fit_keywords'):
         if optional_key in resume:
             normalized[optional_key] = resume[optional_key]
     return normalized
-
 
 
 def _build_summary(profile: dict, target_title: str, prioritized_skills: list[str], prompt_guidance: str) -> str:
