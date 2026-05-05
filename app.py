@@ -2070,6 +2070,9 @@ def profile_settings_page(user: dict) -> None:
             'education_history': _parse_education_history(education_text),
             'uploaded_resume': uploaded_resume_record,
         }
+        if not selected_profile.get('id'):
+            payload['created_by_user_id'] = str(user.get('id', '')).strip()
+            payload['created_by_username'] = str(user.get('username', '')).strip()
         storage.upsert_profile(payload)
         st.success('Profile saved.')
         st.rerun()
@@ -2637,8 +2640,7 @@ def user_access_page(user: dict) -> None:
                             st.rerun()
                 with c2:
                     if st.button('Reject / delete', key=f"reject_user_{pending.get('id')}", use_container_width=True):
-                        remaining = [item for item in storage.get_users() if item.get('id') != pending.get('id')]
-                        storage._write_json(storage.users_path, remaining)
+                        storage.delete_user(pending.get('id', ''))
                         st.success('Pending request removed.')
                         st.rerun()
     with approved_tab:
