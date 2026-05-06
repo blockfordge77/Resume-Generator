@@ -2140,59 +2140,190 @@ def _assigned_profile_help_text(selected_profiles: list[dict], owner_map: dict[s
     return 'Each profile can be assigned to only one user. Profiles already assigned to other users are hidden from this picker.'
 
 
-def _render_approved_user_row(member: dict, profiles: list[dict], users: list[dict], *, key_prefix: str) -> None:
-    member_id = str(member.get('id', '')).strip()
-    available_profiles, owner_map = _available_profiles_for_user_assignment(
-        profiles, users, member_id, member.get('assigned_profile_ids', [])
-    )
-    assigned = st.multiselect(
-        'Assigned profiles',
-        available_profiles,
-        default=[p for p in available_profiles if p.get('id') in (member.get('assigned_profile_ids', []) or [])],
-        format_func=_format_profile_option,
-        key=f'{key_prefix}_profiles_{member_id}',
-    )
-    st.caption(_assigned_profile_help_text(assigned, owner_map))
-    member_is_admin = st.checkbox(
-        'Admin user',
-        value=bool(member.get('is_admin', False)),
-        key=f'{key_prefix}_admin_{member_id}',
-    )
-    new_password = st.text_input(
-        'Reset password (optional)',
-        type='password',
-        key=f'{key_prefix}_password_{member_id}',
-    )
-    save_col, delete_col = st.columns([3, 1])
-    with save_col:
-        if st.button('Save user access', key=f'{key_prefix}_save_{member_id}', type='primary', use_container_width=True):
-            assigned_ids = [item.get('id') for item in assigned]
-            conflicting = [owner_map.get(str(profile_id)) for profile_id in assigned_ids if str(profile_id) in owner_map]
-            if conflicting:
-                st.error('One or more selected profiles are already assigned to another user. Refresh and choose only unassigned profiles.')
-                return
-            patch = {'assigned_profile_ids': assigned_ids, 'is_admin': member_is_admin, 'status': 'approved'}
-            if new_password.strip():
-                patch |= build_password_record(new_password.strip()) | {'force_password_change': False}
-            storage.update_user(member_id, patch)
-            st.success('User updated.')
+SUPERADMIN_USER_ID = 'user_admin_default'
+
+
+def _is_superadmin(user: dict | None) -> bool:
+    return bool(user) and str(user.get('id', '')).strip() == SUPERADMIN_USER_ID
+
+
+def _can_edit_admin(current_user: dict, target_admin: dict) -> bool:
+    if _is_superadmin(current_user):
+        return True
+    return str(target_admin.get('id', '')).strip() == str(current_user.get('id', '')).strip()
+
+
+def _can_delete_admin(current_user: dict, target_admin: dict) -> bool:
+    if str(target_admin.get('id', '')).strip() == str(current_user.get('id', '')).strip():
+        return False
+    return _is_superadmin(current_user)
+
+
+def _can_edit_bidder(current_user: dict, bidder: dict) -> bool:
+    if _is_superadmin(current_user):
+        return True
+    return str(bidder.get('parent_admin_id', '')).strip() == str(current_user.get('id', '')).strip()
+
+
+def _can_delete_bidder(current_user: dict, bidder: dict) -> bool:
+    if str(bidder.get('id', '')).strip() == str(current_user.get('id', '')).strip():
+        return False
+    return _can_edit_bidder(current_user, bidder)
+
+
+def _render_delete_button(*, scope: str, target_id: str, target_label: str, on_confirm) -> None:
+    confirm_key = f'{scope}_confirm_delete_{target_id}'
+    if st.session_state.get(confirm_key):
+        yes, no = st.columns(2)
+        if yes.button('Yes', key=f'{scope}_yes_delete_{target_id}', type='primary', use_container_width=True):
+            on_confirm()
+            st.session_state.pop(confirm_key, None)
+            st.success(f'{target_label} deleted.')
             st.rerun()
-    with delete_col:
-        confirm_key = f'{key_prefix}_confirm_delete_{member_id}'
-        if st.session_state.get(confirm_key):
-            yes, no = st.columns(2)
-            if yes.button('Yes', key=f'{key_prefix}_yes_delete_{member_id}', type='primary', use_container_width=True):
-                storage.delete_user(member_id)
-                st.session_state.pop(confirm_key, None)
-                st.success('User deleted.')
-                st.rerun()
-            if no.button('No', key=f'{key_prefix}_no_delete_{member_id}', use_container_width=True):
-                st.session_state.pop(confirm_key, None)
-                st.rerun()
+        if no.button('No', key=f'{scope}_no_delete_{target_id}', use_container_width=True):
+            st.session_state.pop(confirm_key, None)
+            st.rerun()
+    else:
+        if st.button('Delete', key=f'{scope}_delete_{target_id}', use_container_width=True):
+            st.session_state[confirm_key] = True
+            st.rerun()
+
+
+def _render_admin_card(current_user: dict, admin: dict) -> None:
+    """Slim admin card. No profile assignment, no admin-toggle.
+
+    Layout: password input + Save + Delete on a single row.
+    """
+    admin_id = str(admin.get('id', '')).strip()
+    can_edit = _can_edit_admin(current_user, admin)
+    can_delete = _can_delete_admin(current_user, admin)
+
+    if not can_edit and not can_delete:
+        st.caption('Read-only — only the Superadmin can manage this admin.')
+        return
+
+    if can_edit:
+        st.markdown('Reset password (optional)')
+        pwd_col, save_col, delete_col = st.columns([4, 1, 2])
+        with pwd_col:
+            new_password = st.text_input(
+                'Reset password',
+                type='password',
+                key=f'admin_pwd_{admin_id}',
+                placeholder='Leave blank to keep current',
+                label_visibility='collapsed',
+            )
+        with save_col:
+            if st.button('Save', key=f'admin_save_{admin_id}', type='primary', use_container_width=True):
+                pwd = (new_password or '').strip()
+                if not pwd:
+                    st.warning('Enter a new password to save.')
+                else:
+                    storage.update_user(admin_id, build_password_record(pwd) | {'force_password_change': False})
+                    st.success('Password updated.')
+                    st.rerun()
+        with delete_col:
+            if can_delete:
+                _render_delete_button(
+                    scope='admin',
+                    target_id=admin_id,
+                    target_label='Admin',
+                    on_confirm=lambda: storage.delete_user(admin_id),
+                )
+    elif can_delete:
+        _, delete_col = st.columns([5, 2])
+        with delete_col:
+            _render_delete_button(
+                scope='admin',
+                target_id=admin_id,
+                target_label='Admin',
+                on_confirm=lambda: storage.delete_user(admin_id),
+            )
+
+
+def _render_bidder_row(current_user: dict, bidder: dict, profiles: list[dict], users: list[dict]) -> None:
+    """Click-to-toggle bidder row inside an admin's expander.
+
+    Streamlit forbids nested st.expander, so we fake it: a full-width button
+    whose label flips between ▶ and ▼ drives an open/closed state in
+    st.session_state, and the body renders only when open. The button is
+    wrapped in st.container(key=...) so we can left-align its label via the
+    scoped CSS injected once per page.
+    """
+    bidder_id = str(bidder.get('id', '')).strip()
+    expand_key = f'bidder_expand_{bidder_id}'
+    is_open = bool(st.session_state.get(expand_key, False))
+
+    arrow = '▼' if is_open else '▶'
+    label = f"{arrow}  {bidder.get('full_name') or bidder.get('username')}  ·  {bidder.get('username')}"
+    with st.container(key=f'bidder-toggle-{bidder_id}'):
+        if st.button(label, key=f'bidder_toggle_btn_{bidder_id}', use_container_width=True):
+            st.session_state[expand_key] = not is_open
+            st.rerun()
+
+    if not is_open:
+        return
+
+    can_edit = _can_edit_bidder(current_user, bidder)
+    can_delete = _can_delete_bidder(current_user, bidder)
+
+    with st.container(border=True):
+        available_profiles, owner_map = _available_profiles_for_user_assignment(
+            profiles, users, bidder_id, bidder.get('assigned_profile_ids', [])
+        )
+        selected = st.multiselect(
+            'Assigned profiles',
+            available_profiles,
+            default=[p for p in available_profiles if p.get('id') in (bidder.get('assigned_profile_ids', []) or [])],
+            format_func=_format_profile_option,
+            key=f'bidder_profiles_{bidder_id}',
+            disabled=not can_edit,
+        )
+        if can_edit:
+            st.caption(_assigned_profile_help_text(selected, owner_map))
+            st.markdown('Reset password (optional)')
+            pwd_col, save_col, delete_col = st.columns([4, 1, 2])
+            with pwd_col:
+                new_password = st.text_input(
+                    'Reset password',
+                    type='password',
+                    key=f'bidder_pwd_{bidder_id}',
+                    placeholder='Leave blank to keep current',
+                    label_visibility='collapsed',
+                )
+            with save_col:
+                if st.button('Save', key=f'bidder_save_{bidder_id}', type='primary', use_container_width=True):
+                    assigned_ids = [item.get('id') for item in selected]
+                    conflicting = [owner_map.get(str(pid)) for pid in assigned_ids if str(pid) in owner_map]
+                    if conflicting:
+                        st.error('One or more selected profiles are already assigned to another user. Refresh and choose only unassigned profiles.')
+                    else:
+                        patch = {'assigned_profile_ids': assigned_ids}
+                        pwd = (new_password or '').strip()
+                        if pwd:
+                            patch |= build_password_record(pwd) | {'force_password_change': False}
+                        storage.update_user(bidder_id, patch)
+                        st.success('Bidder updated.')
+                        st.rerun()
+            with delete_col:
+                if can_delete:
+                    _render_delete_button(
+                        scope='bidder',
+                        target_id=bidder_id,
+                        target_label='Bidder',
+                        on_confirm=lambda: storage.delete_user(bidder_id),
+                    )
         else:
-            if st.button('Delete', key=f'{key_prefix}_delete_{member_id}', use_container_width=True):
-                st.session_state[confirm_key] = True
-                st.rerun()
+            st.caption('Read-only — only the owner admin or Superadmin can edit this bidder.')
+            if can_delete:
+                _, delete_col = st.columns([5, 2])
+                with delete_col:
+                    _render_delete_button(
+                        scope='bidder',
+                        target_id=bidder_id,
+                        target_label='Bidder',
+                        on_confirm=lambda: storage.delete_user(bidder_id),
+                    )
 
 
 def _record_openai_usage(result: dict, kind: str) -> None:
@@ -2657,6 +2788,28 @@ def user_access_page(user: dict) -> None:
         return
     show_header(user)
     st.subheader('User Access')
+    st.markdown(
+        """
+        <style>
+        div[class*="st-key-bidder-toggle-"] button,
+        div[class*="st-key-admin-list-"] button {
+            justify-content: flex-start !important;
+        }
+        div[class*="st-key-bidder-toggle-"] button > div,
+        div[class*="st-key-admin-list-"] button > div {
+            text-align: left !important;
+            width: 100% !important;
+        }
+        div[class*="st-key-bidder-toggle-"] button p,
+        div[class*="st-key-admin-list-"] button p {
+            text-align: left !important;
+            width: 100% !important;
+            margin: 0 !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
     profiles = storage.get_profiles()
     users = storage.get_users()
     pending_users = [item for item in users if item.get('status') == 'pending']
@@ -2711,40 +2864,84 @@ def user_access_page(user: dict) -> None:
             key=lambda m: (m.get('full_name') or m.get('username') or '').lower(),
         )
         bidders = [m for m in approved_users if not m.get('is_admin')]
-        bidders_by_admin: dict[str, list[dict]] = {}
         admin_ids = {a.get('id', '') for a in admins}
+        bidders_by_admin: dict[str, list[dict]] = {}
         for b in bidders:
             parent = str(b.get('parent_admin_id', '')).strip()
-            key = parent if parent in admin_ids else ''
-            bidders_by_admin.setdefault(key, []).append(b)
-        for key in bidders_by_admin:
-            bidders_by_admin[key].sort(key=lambda m: (m.get('full_name') or m.get('username') or '').lower())
+            ka = parent if parent in admin_ids else ''
+            bidders_by_admin.setdefault(ka, []).append(b)
+        for ka in bidders_by_admin:
+            bidders_by_admin[ka].sort(key=lambda m: (m.get('full_name') or m.get('username') or '').lower())
+        orphans = bidders_by_admin.get('', [])
 
         if not admins:
             st.info('No admins yet.')
+        else:
+            ORPHANS_KEY = '__orphans__'
+            valid_selections = admin_ids | ({ORPHANS_KEY} if orphans else set())
+            selection_state = 'user_access_selected_admin_id'
+            current_user_id = str(user.get('id', '')).strip()
+            if st.session_state.get(selection_state) not in valid_selections:
+                st.session_state[selection_state] = (
+                    current_user_id if current_user_id in admin_ids else admins[0].get('id', '')
+                )
+            selected_id = st.session_state[selection_state]
 
-        for admin in admins:
-            admin_id = admin.get('id', '')
-            owned = bidders_by_admin.get(admin_id, [])
-            label = f"{admin.get('full_name') or admin.get('username')}  •  Admin  •  {len(owned)} bidder{'s' if len(owned) != 1 else ''}"
-            with st.expander(label):
-                _render_approved_user_row(admin, profiles, users, key_prefix='admin')
-                if owned:
-                    st.markdown('---')
-                    st.caption(f'Bidders invited by {admin.get("full_name") or admin.get("username")}')
-                    for bidder in owned:
-                        with st.container(border=True):
-                            st.markdown(f"**{bidder.get('full_name') or bidder.get('username')}** &nbsp; `{bidder.get('username')}`")
-                            _render_approved_user_row(bidder, profiles, users, key_prefix='bidder')
+            left, right = st.columns([4, 6], gap='medium')
 
-        orphans = bidders_by_admin.get('', [])
-        if orphans:
-            with st.expander(f"Unassigned bidders  •  {len(orphans)}"):
-                st.caption('These bidders predate the parent-admin tracking. Visible for audit only.')
-                for bidder in orphans:
-                    with st.container(border=True):
-                        st.markdown(f"**{bidder.get('full_name') or bidder.get('username')}** &nbsp; `{bidder.get('username')}`")
-                        _render_approved_user_row(bidder, profiles, users, key_prefix='orphan')
+            with left:
+                st.markdown('**Admins**')
+                for admin in admins:
+                    admin_id = admin.get('id', '')
+                    owned_count = len(bidders_by_admin.get(admin_id, []))
+                    is_selected = admin_id == selected_id
+                    name = admin.get('full_name') or admin.get('username')
+                    label = f"{name}  ·  {owned_count} bidder{'s' if owned_count != 1 else ''}"
+                    with st.container(key=f'admin-list-{admin_id}'):
+                        if st.button(
+                            label,
+                            key=f'select_admin_{admin_id}',
+                            type='primary' if is_selected else 'secondary',
+                            use_container_width=True,
+                        ):
+                            st.session_state[selection_state] = admin_id
+                            st.rerun()
+                if orphans:
+                    st.divider()
+                    is_selected = selected_id == ORPHANS_KEY
+                    with st.container(key='admin-list-orphans'):
+                        if st.button(
+                            f"Unassigned  ·  {len(orphans)}",
+                            key='select_orphans',
+                            type='primary' if is_selected else 'secondary',
+                            use_container_width=True,
+                        ):
+                            st.session_state[selection_state] = ORPHANS_KEY
+                            st.rerun()
+
+            with right:
+                if selected_id == ORPHANS_KEY:
+                    st.markdown('### Unassigned bidders')
+                    st.caption('These bidders predate parent-admin tracking. Only the Superadmin can manage them.')
+                    for bidder in orphans:
+                        _render_bidder_row(user, bidder, profiles, users)
+                else:
+                    selected_admin = next((a for a in admins if a.get('id') == selected_id), None)
+                    if selected_admin is None:
+                        st.info('Select an admin from the left.')
+                    else:
+                        name = selected_admin.get('full_name') or selected_admin.get('username')
+                        st.markdown(f"### {name}")
+                        st.caption('Admin')
+                        _render_admin_card(user, selected_admin)
+                        owned = bidders_by_admin.get(selected_admin.get('id', ''), [])
+                        st.divider()
+                        st.markdown(f"**Bidders ({len(owned)})**")
+                        if owned:
+                            for bidder in owned:
+                                _render_bidder_row(user, bidder, profiles, users)
+                        else:
+                            st.caption('No bidders invited by this admin yet.')
 
     with metrics_tab:
         _render_application_metrics_tab()
