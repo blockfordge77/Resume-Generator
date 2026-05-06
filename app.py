@@ -2171,30 +2171,33 @@ def _can_delete_bidder(current_user: dict, bidder: dict) -> bool:
     return _can_edit_bidder(current_user, bidder)
 
 
-def _render_delete_button(*, scope: str, target_id: str, target_label: str, on_confirm) -> None:
-    confirm_key = f'{scope}_confirm_delete_{target_id}'
-    if st.session_state.get(confirm_key):
-        yes, no = st.columns(2)
-        if yes.button('Yes', key=f'{scope}_yes_delete_{target_id}', type='primary', use_container_width=True):
+def _trigger_delete_dialog(*, scope: str, target_id: str, target_name: str, success_label: str, on_confirm) -> None:
+    """Open a modal asking the user to confirm a destructive action.
+
+    Defined at call-time as a closure over ``on_confirm`` so it can be reused
+    for any deletable entity. Streamlit's ``@st.dialog`` decorator opens a
+    proper modal overlay, which keeps our row layout free of inline Yes/No
+    buttons that were forcing uneven column widths.
+    """
+    @st.dialog(f'Delete {scope}')
+    def _dlg() -> None:
+        st.write(f"Are you sure you want to delete **{target_name}**?")
+        st.caption('This action cannot be undone.')
+        yes_col, no_col = st.columns(2)
+        if yes_col.button('Yes, delete', key=f'{scope}_dlg_yes_{target_id}', type='primary', use_container_width=True):
             on_confirm()
-            st.session_state.pop(confirm_key, None)
-            st.success(f'{target_label} deleted.')
+            st.success(f'{success_label} deleted.')
             st.rerun()
-        if no.button('No', key=f'{scope}_no_delete_{target_id}', use_container_width=True):
-            st.session_state.pop(confirm_key, None)
+        if no_col.button('Cancel', key=f'{scope}_dlg_no_{target_id}', use_container_width=True):
             st.rerun()
-    else:
-        if st.button('Delete', key=f'{scope}_delete_{target_id}', use_container_width=True):
-            st.session_state[confirm_key] = True
-            st.rerun()
+
+    _dlg()
 
 
 def _render_admin_card(current_user: dict, admin: dict) -> None:
-    """Slim admin card. No profile assignment, no admin-toggle.
-
-    Layout: password input + Save + Delete on a single row.
-    """
+    """Slim admin card: label + password input + Save + Delete on a single row."""
     admin_id = str(admin.get('id', '')).strip()
+    name = admin.get('full_name') or admin.get('username') or admin_id
     can_edit = _can_edit_admin(current_user, admin)
     can_delete = _can_delete_admin(current_user, admin)
 
@@ -2203,86 +2206,83 @@ def _render_admin_card(current_user: dict, admin: dict) -> None:
         return
 
     if can_edit:
-        st.markdown('Reset password (optional)')
-        pwd_col, save_col, delete_col = st.columns([4, 1, 2])
-        with pwd_col:
-            new_password = st.text_input(
-                'Reset password',
-                type='password',
-                key=f'admin_pwd_{admin_id}',
-                placeholder='Leave blank to keep current',
-                label_visibility='collapsed',
-            )
-        with save_col:
-            if st.button('Save', key=f'admin_save_{admin_id}', type='primary', use_container_width=True):
-                pwd = (new_password or '').strip()
-                if not pwd:
-                    st.warning('Enter a new password to save.')
-                else:
-                    storage.update_user(admin_id, build_password_record(pwd) | {'force_password_change': False})
-                    st.success('Password updated.')
-                    st.rerun()
-        with delete_col:
-            if can_delete:
-                _render_delete_button(
-                    scope='admin',
-                    target_id=admin_id,
-                    target_label='Admin',
-                    on_confirm=lambda: storage.delete_user(admin_id),
+        with st.container(key=f'admin-card-{admin_id}'):
+            label_col, pwd_col, save_col, delete_col = st.columns([2, 3, 1, 1], gap='small')
+            with label_col:
+                st.markdown('<div class="card-label">Reset password</div>', unsafe_allow_html=True)
+            with pwd_col:
+                new_password = st.text_input(
+                    'Reset password',
+                    type='password',
+                    key=f'admin_pwd_{admin_id}',
+                    placeholder='Leave blank to keep current',
+                    label_visibility='collapsed',
                 )
+            with save_col:
+                if st.button('Save', key=f'admin_save_{admin_id}', type='primary', use_container_width=True):
+                    pwd = (new_password or '').strip()
+                    if not pwd:
+                        st.warning('Enter a new password to save.')
+                    else:
+                        storage.update_user(admin_id, build_password_record(pwd) | {'force_password_change': False})
+                        st.success('Password updated.')
+                        st.rerun()
+            with delete_col:
+                if st.button(
+                    'Delete',
+                    key=f'admin_delete_{admin_id}',
+                    use_container_width=True,
+                    disabled=not can_delete,
+                ):
+                    _trigger_delete_dialog(
+                        scope='admin',
+                        target_id=admin_id,
+                        target_name=name,
+                        success_label='Admin',
+                        on_confirm=lambda: storage.delete_user(admin_id),
+                    )
     elif can_delete:
-        _, delete_col = st.columns([5, 2])
-        with delete_col:
-            _render_delete_button(
-                scope='admin',
-                target_id=admin_id,
-                target_label='Admin',
-                on_confirm=lambda: storage.delete_user(admin_id),
-            )
+        with st.container(key=f'admin-card-{admin_id}'):
+            _, delete_col = st.columns([5, 1])
+            with delete_col:
+                if st.button('Delete', key=f'admin_delete_{admin_id}', use_container_width=True):
+                    _trigger_delete_dialog(
+                        scope='admin',
+                        target_id=admin_id,
+                        target_name=name,
+                        success_label='Admin',
+                        on_confirm=lambda: storage.delete_user(admin_id),
+                    )
 
 
-def _render_bidder_row(current_user: dict, bidder: dict, profiles: list[dict], users: list[dict]) -> None:
-    """Click-to-toggle bidder row inside an admin's expander.
+def _render_bidder_card(current_user: dict, bidder: dict, profiles: list[dict], users: list[dict]) -> None:
+    """Bidder body rendered inside a parent ``st.expander``.
 
-    Streamlit forbids nested st.expander, so we fake it: a full-width button
-    whose label flips between ▶ and ▼ drives an open/closed state in
-    st.session_state, and the body renders only when open. The button is
-    wrapped in st.container(key=...) so we can left-align its label via the
-    scoped CSS injected once per page.
+    The expander wrapper handles the open/close UI; this function only
+    renders the contents (profile multiselect, password row, action buttons).
     """
     bidder_id = str(bidder.get('id', '')).strip()
-    expand_key = f'bidder_expand_{bidder_id}'
-    is_open = bool(st.session_state.get(expand_key, False))
-
-    arrow = '▼' if is_open else '▶'
-    label = f"{arrow}  {bidder.get('full_name') or bidder.get('username')}  ·  {bidder.get('username')}"
-    with st.container(key=f'bidder-toggle-{bidder_id}'):
-        if st.button(label, key=f'bidder_toggle_btn_{bidder_id}', use_container_width=True):
-            st.session_state[expand_key] = not is_open
-            st.rerun()
-
-    if not is_open:
-        return
-
+    name = bidder.get('full_name') or bidder.get('username') or bidder_id
     can_edit = _can_edit_bidder(current_user, bidder)
     can_delete = _can_delete_bidder(current_user, bidder)
 
-    with st.container(border=True):
-        available_profiles, owner_map = _available_profiles_for_user_assignment(
-            profiles, users, bidder_id, bidder.get('assigned_profile_ids', [])
-        )
-        selected = st.multiselect(
-            'Assigned profiles',
-            available_profiles,
-            default=[p for p in available_profiles if p.get('id') in (bidder.get('assigned_profile_ids', []) or [])],
-            format_func=_format_profile_option,
-            key=f'bidder_profiles_{bidder_id}',
-            disabled=not can_edit,
-        )
-        if can_edit:
-            st.caption(_assigned_profile_help_text(selected, owner_map))
-            st.markdown('Reset password (optional)')
-            pwd_col, save_col, delete_col = st.columns([4, 1, 2])
+    available_profiles, owner_map = _available_profiles_for_user_assignment(
+        profiles, users, bidder_id, bidder.get('assigned_profile_ids', [])
+    )
+    selected = st.multiselect(
+        'Assigned profiles',
+        available_profiles,
+        default=[p for p in available_profiles if p.get('id') in (bidder.get('assigned_profile_ids', []) or [])],
+        format_func=_format_profile_option,
+        key=f'bidder_profiles_{bidder_id}',
+        disabled=not can_edit,
+        help='One user per profile.',
+    )
+    if can_edit:
+        with st.container(key=f'bidder-card-{bidder_id}'):
+            label_col, pwd_col, save_col, delete_col = st.columns([2, 3, 1, 1], gap='small')
+            with label_col:
+                st.markdown('<div class="card-label">Reset password</div>', unsafe_allow_html=True)
             with pwd_col:
                 new_password = st.text_input(
                     'Reset password',
@@ -2306,24 +2306,33 @@ def _render_bidder_row(current_user: dict, bidder: dict, profiles: list[dict], u
                         st.success('Bidder updated.')
                         st.rerun()
             with delete_col:
-                if can_delete:
-                    _render_delete_button(
+                if st.button(
+                    'Delete',
+                    key=f'bidder_delete_{bidder_id}',
+                    use_container_width=True,
+                    disabled=not can_delete,
+                ):
+                    _trigger_delete_dialog(
                         scope='bidder',
                         target_id=bidder_id,
-                        target_label='Bidder',
+                        target_name=name,
+                        success_label='Bidder',
                         on_confirm=lambda: storage.delete_user(bidder_id),
                     )
-        else:
-            st.caption('Read-only — only the owner admin or Superadmin can edit this bidder.')
-            if can_delete:
-                _, delete_col = st.columns([5, 2])
+    else:
+        st.caption('Read-only — only the owner admin or Superadmin can edit this bidder.')
+        if can_delete:
+            with st.container(key=f'bidder-card-{bidder_id}'):
+                _, delete_col = st.columns([5, 1])
                 with delete_col:
-                    _render_delete_button(
-                        scope='bidder',
-                        target_id=bidder_id,
-                        target_label='Bidder',
-                        on_confirm=lambda: storage.delete_user(bidder_id),
-                    )
+                    if st.button('Delete', key=f'bidder_delete_{bidder_id}', use_container_width=True):
+                        _trigger_delete_dialog(
+                            scope='bidder',
+                            target_id=bidder_id,
+                            target_name=name,
+                            success_label='Bidder',
+                            on_confirm=lambda: storage.delete_user(bidder_id),
+                        )
 
 
 def _record_openai_usage(result: dict, kind: str) -> None:
@@ -2788,28 +2797,6 @@ def user_access_page(user: dict) -> None:
         return
     show_header(user)
     st.subheader('User Access')
-    st.markdown(
-        """
-        <style>
-        div[class*="st-key-bidder-toggle-"] button,
-        div[class*="st-key-admin-list-"] button {
-            justify-content: flex-start !important;
-        }
-        div[class*="st-key-bidder-toggle-"] button > div,
-        div[class*="st-key-admin-list-"] button > div {
-            text-align: left !important;
-            width: 100% !important;
-        }
-        div[class*="st-key-bidder-toggle-"] button p,
-        div[class*="st-key-admin-list-"] button p {
-            text-align: left !important;
-            width: 100% !important;
-            margin: 0 !important;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
     profiles = storage.get_profiles()
     users = storage.get_users()
     pending_users = [item for item in users if item.get('status') == 'pending']
@@ -2878,70 +2865,227 @@ def user_access_page(user: dict) -> None:
             st.info('No admins yet.')
         else:
             ORPHANS_KEY = '__orphans__'
-            valid_selections = admin_ids | ({ORPHANS_KEY} if orphans else set())
+            options = [a.get('id', '') for a in admins]
+            if orphans:
+                options.append(ORPHANS_KEY)
+
+            def _format_admin_option(option_id: str) -> str:
+                if option_id == ORPHANS_KEY:
+                    n = len(orphans)
+                    return f"Unassigned  ·  {n} bidder{'s' if n != 1 else ''}"
+                admin = next((a for a in admins if a.get('id') == option_id), None)
+                n = len(bidders_by_admin.get(option_id, []))
+                name = (admin or {}).get('full_name') or (admin or {}).get('username') or option_id
+                return f"{name}  ·  {n} bidder{'s' if n != 1 else ''}"
+
             selection_state = 'user_access_selected_admin_id'
             current_user_id = str(user.get('id', '')).strip()
-            if st.session_state.get(selection_state) not in valid_selections:
+            if st.session_state.get(selection_state) not in set(options):
                 st.session_state[selection_state] = (
-                    current_user_id if current_user_id in admin_ids else admins[0].get('id', '')
+                    current_user_id if current_user_id in admin_ids else options[0]
                 )
-            selected_id = st.session_state[selection_state]
 
-            left, right = st.columns([4, 6], gap='medium')
+            # Bump the admin nav typography and radio dot size; CSS is scoped
+            # to the container key so it doesn't leak to other radios on the
+            # page. Injected once per render.
+            st.markdown(
+                """
+                <style>
+                /* ── Left nav typography ─────────────────────────────────────── */
+                div[class*="st-key-admins-nav"] [data-testid="stMarkdownContainer"] p {
+                    font-size: 1.05rem !important;
+                    line-height: 1.5 !important;
+                    margin: 0 !important;
+                }
+                div[class*="st-key-admins-nav"] [role="radiogroup"] > label {
+                    padding: 0.45rem 0 !important;
+                    align-items: center !important;
+                }
+                div[class*="st-key-admins-nav"] [role="radiogroup"] [data-baseweb="radio"] > div:first-child {
+                    transform: scale(1.2);
+                    transform-origin: left center;
+                }
+                /* ── Compact form row (password + buttons) ───────────────────── */
+                div[class*="st-key-admin-card-"] [data-testid="stTextInput"],
+                div[class*="st-key-bidder-card-"] [data-testid="stTextInput"] {
+                    margin-bottom: 0 !important;
+                }
+                div[class*="st-key-admin-card-"] [data-baseweb="form-control"],
+                div[class*="st-key-bidder-card-"] [data-baseweb="form-control"] {
+                    gap: 0 !important;
+                    margin: 0 !important;
+                }
+                div[class*="st-key-admin-card-"] [data-baseweb="input"],
+                div[class*="st-key-bidder-card-"] [data-baseweb="input"] {
+                    height: 34px !important;
+                    display: flex !important;
+                    align-items: center !important;
+                }
+                div[class*="st-key-admin-card-"] [data-baseweb="input"] input,
+                div[class*="st-key-bidder-card-"] [data-baseweb="input"] input {
+                    padding-top: 0 !important;
+                    padding-bottom: 0 !important;
+                    flex: 1 !important;
+                    min-width: 0 !important;
+                }
+                /* Eye-icon toggle: keep auto-sized so it doesn't inherit full-width */
+                div[class*="st-key-admin-card-"] [data-baseweb="input"] button,
+                div[class*="st-key-bidder-card-"] [data-baseweb="input"] button {
+                    height: auto !important;
+                    min-height: unset !important;
+                    width: auto !important;
+                    padding: 0 4px !important;
+                    flex-shrink: 0 !important;
+                }
+                /* Save / Delete: stBaseButton keeps this from matching the eye button */
+                div[class*="st-key-admin-card-"] [data-testid^="stBaseButton"],
+                div[class*="st-key-bidder-card-"] [data-testid^="stBaseButton"] {
+                    height: 34px !important;
+                    min-height: 34px !important;
+                    padding: 0 0.5rem !important;
+                    width: 100% !important;
+                    box-sizing: border-box !important;
+                }
+                .card-label {
+                    padding-top: 7px;
+                    font-size: 0.9rem;
+                    line-height: 1.4;
+                    white-space: nowrap;
+                }
 
-            with left:
-                st.markdown('**Admins**')
-                for admin in admins:
-                    admin_id = admin.get('id', '')
-                    owned_count = len(bidders_by_admin.get(admin_id, []))
-                    is_selected = admin_id == selected_id
-                    name = admin.get('full_name') or admin.get('username')
-                    label = f"{name}  ·  {owned_count} bidder{'s' if owned_count != 1 else ''}"
-                    with st.container(key=f'admin-list-{admin_id}'):
-                        if st.button(
-                            label,
-                            key=f'select_admin_{admin_id}',
-                            type='primary' if is_selected else 'secondary',
-                            use_container_width=True,
-                        ):
-                            st.session_state[selection_state] = admin_id
-                            st.rerun()
-                if orphans:
-                    st.divider()
-                    is_selected = selected_id == ORPHANS_KEY
-                    with st.container(key='admin-list-orphans'):
-                        if st.button(
-                            f"Unassigned  ·  {len(orphans)}",
-                            key='select_orphans',
-                            type='primary' if is_selected else 'secondary',
-                            use_container_width=True,
-                        ):
-                            st.session_state[selection_state] = ORPHANS_KEY
-                            st.rerun()
+                /* ── Responsive: tablet ≤ 900px ──────────────────────────────── */
+                /* Collapse the two outer [2,_,2] padding columns so content
+                   stretches edge-to-edge on narrower screens.
+                   :has(> stColumn:nth-child(3)) identifies the 3-column outer
+                   block without touching the 2-column master-detail block. */
+                @media (max-width: 900px) {
+                    div[class*="st-key-admins-outer"]
+                        [data-testid="stHorizontalBlock"]:has(
+                            > [data-testid="stColumn"]:nth-child(3)
+                        )
+                        > [data-testid="stColumn"]:first-child,
+                    div[class*="st-key-admins-outer"]
+                        [data-testid="stHorizontalBlock"]:has(
+                            > [data-testid="stColumn"]:nth-child(3)
+                        )
+                        > [data-testid="stColumn"]:last-child {
+                        flex: 0 0 0 !important;
+                        min-width: 0 !important;
+                        padding: 0 !important;
+                        overflow: hidden !important;
+                    }
+                    div[class*="st-key-admins-outer"]
+                        [data-testid="stHorizontalBlock"]:has(
+                            > [data-testid="stColumn"]:nth-child(3)
+                        )
+                        > [data-testid="stColumn"]:nth-child(2) {
+                        flex: 1 1 100% !important;
+                        max-width: 100% !important;
+                    }
+                }
 
-            with right:
-                if selected_id == ORPHANS_KEY:
-                    st.markdown('### Unassigned bidders')
-                    st.caption('These bidders predate parent-admin tracking. Only the Superadmin can manage them.')
-                    for bidder in orphans:
-                        _render_bidder_row(user, bidder, profiles, users)
-                else:
-                    selected_admin = next((a for a in admins if a.get('id') == selected_id), None)
-                    if selected_admin is None:
-                        st.info('Select an admin from the left.')
-                    else:
-                        name = selected_admin.get('full_name') or selected_admin.get('username')
-                        st.markdown(f"### {name}")
-                        st.caption('Admin')
-                        _render_admin_card(user, selected_admin)
-                        owned = bidders_by_admin.get(selected_admin.get('id', ''), [])
-                        st.divider()
-                        st.markdown(f"**Bidders ({len(owned)})**")
-                        if owned:
-                            for bidder in owned:
-                                _render_bidder_row(user, bidder, profiles, users)
+                /* ── Responsive: mobile ≤ 640px ──────────────────────────────── */
+                /* Stack the left nav and right detail panel vertically.
+                   :has(div[class*="st-key-admins-nav"]) pins this to exactly the
+                   top-level split, avoiding the nested [5,1] header columns. */
+                @media (max-width: 640px) {
+                    div[class*="st-key-admins-master-detail"]
+                        [data-testid="stHorizontalBlock"]:has(
+                            div[class*="st-key-admins-nav"]
+                        ) {
+                        flex-direction: column !important;
+                    }
+                    div[class*="st-key-admins-master-detail"]
+                        [data-testid="stHorizontalBlock"]:has(
+                            div[class*="st-key-admins-nav"]
+                        )
+                        > [data-testid="stColumn"] {
+                        flex: 1 1 100% !important;
+                        min-width: 100% !important;
+                        max-width: 100% !important;
+                    }
+                }
+
+                /* ── Responsive: small mobile ≤ 480px ───────────────────────── */
+                /* Stack the label / input / buttons in the password-reset row */
+                @media (max-width: 480px) {
+                    div[class*="st-key-admin-card-"] [data-testid="stHorizontalBlock"],
+                    div[class*="st-key-bidder-card-"] [data-testid="stHorizontalBlock"] {
+                        flex-direction: column !important;
+                    }
+                    div[class*="st-key-admin-card-"] [data-testid="stColumn"],
+                    div[class*="st-key-bidder-card-"] [data-testid="stColumn"] {
+                        flex: 1 1 100% !important;
+                        min-width: 100% !important;
+                        max-width: 100% !important;
+                    }
+                    div[class*="st-key-admin-card-"] [data-baseweb="input"],
+                    div[class*="st-key-bidder-card-"] [data-baseweb="input"] {
+                        width: 100% !important;
+                    }
+                    .card-label {
+                        padding-top: 0 !important;
+                        padding-bottom: 4px !important;
+                        font-weight: 500;
+                    }
+                }
+                </style>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            # Outer [2,8,2]: left/right padding columns collapse on tablet via CSS.
+            # Inner [3,8]: left nav = 3/11 × 8/12 ≈ 18% of page width on desktop.
+            with st.container(key='admins-outer'):
+                outer = st.columns([2, 8, 2])
+                with outer[1]:
+                    with st.container(key='admins-master-detail'):
+                        left, right = st.columns([3, 8], gap='small')
+
+                    with left:
+                        with st.container(key='admins-nav'):
+                            st.markdown('### Admins')
+                            selected_id = st.radio(
+                                'Admin',
+                                options=options,
+                                format_func=_format_admin_option,
+                                label_visibility='collapsed',
+                                key=selection_state,
+                            )
+
+                    with right:
+                        if selected_id == ORPHANS_KEY:
+                            st.markdown('### Unassigned bidders')
+                            st.caption('These bidders predate parent-admin tracking. Only the Superadmin can manage them.')
+                            for bidder in orphans:
+                                bidder_label = f"{bidder.get('full_name') or bidder.get('username')}  ·  {bidder.get('username')}"
+                                with st.expander(bidder_label):
+                                    _render_bidder_card(user, bidder, profiles, users)
                         else:
-                            st.caption('No bidders invited by this admin yet.')
+                            selected_admin = next((a for a in admins if a.get('id') == selected_id), None)
+                            if selected_admin is None:
+                                st.info('Select an admin from the left.')
+                            else:
+                                name = selected_admin.get('full_name') or selected_admin.get('username')
+                                hdr_left, hdr_right = st.columns([5, 1], vertical_alignment='center')
+                                with hdr_left:
+                                    st.markdown(f"### {name}")
+                                with hdr_right:
+                                    st.markdown(
+                                        "<div style='text-align:right; color:#6b7280; font-size:0.95rem;'>Admin</div>",
+                                        unsafe_allow_html=True,
+                                    )
+                                _render_admin_card(user, selected_admin)
+                                owned = bidders_by_admin.get(selected_admin.get('id', ''), [])
+                                st.divider()
+                                st.markdown(f"**Bidders ({len(owned)})**")
+                                if owned:
+                                    for bidder in owned:
+                                        bidder_label = f"{bidder.get('full_name') or bidder.get('username')}  ·  {bidder.get('username')}"
+                                        with st.expander(bidder_label):
+                                            _render_bidder_card(user, bidder, profiles, users)
+                                else:
+                                    st.caption('No bidders invited by this admin yet.')
 
     with metrics_tab:
         _render_application_metrics_tab()
