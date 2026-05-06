@@ -1564,7 +1564,7 @@ def _post_download_dialog() -> None:
             st.rerun()
 
 
-# ---------- Dashboard ----------
+# ---------- To-Do ----------
 
 def dashboard_page(user: dict) -> None:
     show_header(user)
@@ -2028,7 +2028,7 @@ def profile_settings_page(user: dict) -> None:
         st.error('Only admins can manage profiles.')
         return
     show_header(user)
-    st.subheader('Profile Settings')
+    st.subheader('Profiles')
     profiles = storage.get_profiles()
     profile_labels = [f"{p.get('name', 'Unnamed')} - {_profile_resume_status(p)}" for p in profiles]
     mode = st.radio('Profile action', ['Edit existing', 'Create new'], horizontal=True)
@@ -2121,7 +2121,7 @@ def app_settings_page(user: dict) -> None:
         st.error('Only admins can manage app settings.')
         return
     show_header(user)
-    st.subheader('App Settings')
+    st.subheader('Settings')
     settings = storage.get_app_settings()
 
     # ── General settings ──────────────────────────────────────────────────────
@@ -2879,7 +2879,7 @@ def user_access_page(user: dict) -> None:
         st.error('Only admins can manage users.')
         return
     show_header(user)
-    st.subheader('User Access')
+    st.subheader('Users')
     profiles = storage.get_profiles()
     users = storage.get_users()
     pending_users = [item for item in users if item.get('status') == 'pending']
@@ -3194,7 +3194,7 @@ def _load_job_into_dashboard(job: dict) -> None:
     st.session_state['last_target_role'] = job.get('job_title', '')
     st.session_state['last_job_description'] = job.get('description', '')
     st.session_state['last_job_region'] = _normalize_region(job.get('region', ''))
-    queue_nav('Dashboard')
+    queue_nav('To-Do')
 
 
 def _extract_url_from_line(line: str) -> str:
@@ -3283,7 +3283,7 @@ def _render_job_scrape_progress(user: dict, title: str = 'Background scrape prog
 
 def job_list_page(user: dict) -> None:
     show_header(user)
-    st.subheader('Job List')
+    st.subheader('Jobs')
     accessible_profiles = get_accessible_profiles(user)
     generated_items = storage.get_generated_resumes()
     if not is_admin(user):
@@ -3346,7 +3346,7 @@ def job_list_page(user: dict) -> None:
                     if meta_bits:
                         st.caption(' • '.join(meta_bits))
                 with action_col:
-                    if st.button('Use in Dashboard', key=f"use_job_{job.get('id')}", use_container_width=True):
+                    if st.button('Use in To-Do →', key=f"use_job_{job.get('id')}", use_container_width=True):
                         _load_job_into_dashboard(job)
                         st.rerun()
                     if is_admin(user):
@@ -4204,9 +4204,9 @@ def _resume_from_editor(base_resume: dict) -> dict:
 # ---------- Navigation ----------
 
 def render_top_nav(user: dict) -> str:
-    options = ['Dashboard', 'Job List', 'Generated Resumes']
+    options = ['To-Do', 'Jobs', 'Resumes']
     if is_admin(user):
-        options += ['User Access', 'Profile Settings', 'App Settings']
+        options += ['Users', 'Profiles', 'Settings']
     else:
         options += ['My Weekly Result']
 
@@ -4232,9 +4232,9 @@ def render_top_nav(user: dict) -> str:
         generated_total = len([item for item in storage.get_generated_resumes() if item.get('created_by_user_id') == user.get('id')])
 
     def _label(page: str) -> str:
-        if page == 'Dashboard' and current_score is not None:
+        if page == 'To-Do' and current_score is not None:
             return f'{page} ({current_score})'
-        if page == 'Generated Resumes':
+        if page == 'Resumes':
             return f'{page} ({generated_total})'
         return page
 
@@ -4285,17 +4285,17 @@ start_job_scrape_worker(str(APP_DIR / 'data'))
 current_user = require_auth()
 page = render_top_nav(current_user)
 
-if page == 'Dashboard':
+if page == 'To-Do':
     dashboard_page(current_user)
-elif page == 'Job List':
+elif page == 'Jobs':
     job_list_page(current_user)
-elif page == 'Generated Resumes':
+elif page == 'Resumes':
     generated_resumes_page(current_user)
 elif page == 'My Weekly Result':
     my_weekly_result_page(current_user)
-elif page == 'User Access':
+elif page == 'Users':
     user_access_page(current_user)
-elif page == 'Profile Settings':
+elif page == 'Profiles':
     profile_settings_page(current_user)
 else:
     app_settings_page(current_user)
