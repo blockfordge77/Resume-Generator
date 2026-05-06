@@ -176,6 +176,7 @@ def init_state() -> None:
         'current_user_id': '',
         'auth_notice': '',
         'last_resume': None,
+        'last_resume_job_id': '',
         'last_exports': {},
         'last_template_id': '',
         'last_profile_id': '',
@@ -1482,6 +1483,33 @@ def _enforce_low_ats_rate_limit(user: dict, job_id: str, ats_score: int) -> bool
     return True
 
 
+def _enforce_auto_improve_one_shot(user: dict, job_id: str, ats_score: int) -> bool:
+    """One-shot auto-improve gate: if the post-improve score is still under 90, report and advance."""
+    job_id = str(job_id or '').strip()
+    if not job_id or ats_score >= 90:
+        return False
+    auto_reason = (
+        f'Auto-flagged: ATS score stayed below 90 after the one-shot auto-improve '
+        f'(latest score {ats_score}/100). '
+        'Job is under review because the ATS score could not exceed 90 after auto-improve.'
+    )
+    storage.add_job_report(job_id, {
+        'reason': auto_reason,
+        'reported_by_user_id': (user or {}).get('id', ''),
+        'reported_by_username': (user or {}).get('username', ''),
+        'reported_at': datetime.utcnow().isoformat() + 'Z',
+        'source': 'system',
+    })
+    counter_map = st.session_state.setdefault('low_ats_attempts_by_job', {})
+    counter_map.pop(job_id, None)
+    _advance_to_next_dashboard_job(job_id)
+    st.session_state['saved_resume_notice'] = (
+        'ATS stayed below 90 after auto-improve. '
+        'Job auto-reported and under review. Moved to the next job.'
+    )
+    return True
+
+
 def _report_openai_fallback_to_admin(user: dict, job_id: str, result: dict) -> None:
     """Flag the job for admin review when OpenAI generation was requested but fell back to demo."""
     job_id = str(job_id or '').strip()
@@ -1527,6 +1555,7 @@ def _advance_to_next_dashboard_job(current_job_id: str) -> None:
         st.session_state['last_job_description'] = ''
         st.session_state['last_job_region'] = 'ANY'
     st.session_state['last_resume'] = None
+    st.session_state['last_resume_job_id'] = ''
     st.session_state['last_exports'] = {}
 
 
@@ -1722,15 +1751,20 @@ def dashboard_page(user: dict) -> None:
         custom_prompt = st.text_area('Custom resume prompt (optional)', value=st.session_state.get('last_custom_prompt', ''), height=110, placeholder='Example: Keep the resume sharply aligned to backend ownership, emphasize exact named tech stacks in each company bullet, and avoid generic wording.')
 
         is_generating_resume = bool(st.session_state.get('dashboard_is_generating_resume', False))
+        last_resume_job_id_value = str(st.session_state.get('last_resume_job_id', '') or '').strip()
+        has_resume_for_current_job = bool(st.session_state.get('last_resume')) and last_resume_job_id_value == str(selected_job_id or '').strip()
+        create_disabled = is_generating_resume or has_resume_for_current_job
+        create_help = 'A tailored resume has already been generated for this job. Use Auto-improve, Next job, or switch profile/job to create a new one.' if has_resume_for_current_job else None
         create_clicked = st.button(
             'Create tailored resume',
             type='primary',
             use_container_width=True,
-            disabled=is_generating_resume,
+            disabled=create_disabled,
+            help=create_help,
             key='dashboard_create_tailored_resume_button',
         )
 
-        if create_clicked and not is_generating_resume:
+        if create_clicked and not create_disabled:
             if not job_description.strip():
                 st.error('Please paste a job description first.')
                 return
@@ -1780,6 +1814,7 @@ def dashboard_page(user: dict) -> None:
                     st.rerun()
                     return
                 st.session_state['last_resume'] = resume
+                st.session_state['last_resume_job_id'] = str(inputs.get('selected_job_id', '') or '').strip()
                 st.session_state['last_exports'] = exports
                 st.session_state['last_template_id'] = 'uploaded_docx_style'
                 st.session_state['last_profile_id'] = inputs.get('profile_id', '')
@@ -1838,6 +1873,47 @@ def dashboard_page(user: dict) -> None:
                 st.session_state['saved_resume_notice'] = 'PDF download started.'
                 st.session_state['pending_saved_resume'] = payload
                 st.session_state['company_message_dialog_reset_needed'] = True
+                st.rerun()
+        if st.session_state.get('last_resume') and current_ats and int(current_ats.get('overall_score', 0)) < 90:
+            if st.button(
+                'Auto-improve resume to ATS target',
+                type='primary',
+                use_container_width=True,
+                key='dashboard_inline_auto_improve_button',
+                help='One-shot improvement targeting ATS 90+. If the score still stays under 90, the job is auto-reported and you move to the next job.',
+            ):
+                current_resume_for_improve = st.session_state.get('last_resume') or {}
+                job_description_for_improve = st.session_state.get('last_job_description', '')
+                target_role_for_improve = st.session_state.get('last_target_role', '')
+                custom_prompt_for_improve = st.session_state.get('last_custom_prompt', '')
+                with st.spinner('Improving the current draft against ATS guidance...'):
+                    improve_result = improve_resume_to_target_ats(
+                        profile=current_profile,
+                        job_description=job_description_for_improve,
+                        current_resume=current_resume_for_improve,
+                        target_score=91,
+                        max_rounds=1,
+                        additional_requirements='',
+                        target_role=target_role_for_improve,
+                        custom_prompt=custom_prompt_for_improve,
+                        default_prompt=default_prompt,
+                        use_ai=use_ai,
+                        clean_generation=clean_generation,
+                    )
+                    _record_openai_usage_for_improve(improve_result)
+                improved_resume = improve_result.get('resume', current_resume_for_improve)
+                improved_exports = _build_uploaded_docx_pdf_exports(resume=improved_resume, profile=current_profile, app_settings=app_settings)
+                st.session_state['last_resume'] = improved_resume
+                st.session_state['last_exports'] = improved_exports
+                st.session_state['last_generator_mode'] = improve_result.get('mode', 'ats-improve')
+                st.session_state['last_ats_improve_history'] = improve_result.get('history', [])
+                improved_ats = analyze_ats_score(improved_resume, job_description_for_improve, target_role=target_role_for_improve)
+                improved_score = int((improved_ats or {}).get('overall_score', 0))
+                improved_job_id = str(st.session_state.get('last_job_id', '') or '').strip()
+                if improved_job_id and _enforce_auto_improve_one_shot(user, improved_job_id, improved_score):
+                    st.rerun()
+                    return
+                _queue_editor_reload(improved_resume, 'ATS-guided improvement applied to the current draft.')
                 st.rerun()
         if st.session_state.get('last_resume'):
             resume = st.session_state['last_resume']
@@ -3551,40 +3627,9 @@ def _dashboard_ats_notes_tab(profile: dict, template: dict, resume: dict, job_de
     _render_ats_analysis(analysis)
     st.markdown('---')
     _ats_notes_context_block(resume)
-    st.markdown('---')
-    st.markdown('**Auto-improve resume to ATS target**')
-    st.caption('This runs a short revision loop using the current visible draft, the ATS gaps, and your optional extra requirements. It stops once the score reaches the target or the round limit is hit.')
-    st.text_area('Additional ATS improvement requirements (optional)', key='dashboard_ats_improve_prompt', height=110, placeholder='Example: Keep the summary concise, make bullets mention exact backend stacks, and avoid generic phrases.')
-    a1, a2 = st.columns([1.1, 1])
-    with a1:
-        target_score = st.slider('Target ATS score', min_value=90, max_value=99, value=91, key='dashboard_ats_target_score')
-    with a2:
-        max_rounds = st.number_input('Max improvement rounds', min_value=1, max_value=5, value=3, step=1, key='dashboard_ats_max_rounds')
-    if st.button('Auto-improve resume to ATS target', type='primary', use_container_width=True, key='dashboard_ats_improve_button'):
-        current_resume = st.session_state.get('last_resume') or {}
-        if not current_resume:
-            st.error('Generate a resume first.')
-            return
-        with st.spinner('Improving the current draft against ATS guidance...'):
-            result = improve_resume_to_target_ats(profile=profile, job_description=job_description, current_resume=current_resume, target_score=int(target_score), max_rounds=int(max_rounds), additional_requirements=st.session_state.get('dashboard_ats_improve_prompt', ''), target_role=target_role, custom_prompt=custom_prompt, default_prompt=default_prompt, use_ai=use_ai, clean_generation=clean_generation)
-            _record_openai_usage_for_improve(result)
-        updated_resume = result.get('resume', current_resume)
-        exports = _build_uploaded_docx_pdf_exports(resume=updated_resume, profile=profile, app_settings=storage.get_app_settings())
-        st.session_state['last_resume'] = updated_resume
-        st.session_state['last_exports'] = exports
-        st.session_state['last_generator_mode'] = result.get('mode', 'ats-improve')
-        st.session_state['last_ats_improve_history'] = result.get('history', [])
-        improved_ats = analyze_ats_score(updated_resume, job_description, target_role=target_role)
-        improved_score = int((improved_ats or {}).get('overall_score', 0))
-        improved_job_id = str(st.session_state.get('last_job_id', '') or '').strip()
-        active_user = storage.get_user_by_id(st.session_state.get('current_user_id', '')) or {}
-        if improved_job_id and _enforce_low_ats_rate_limit(active_user, improved_job_id, improved_score):
-            st.rerun()
-            return
-        _queue_editor_reload(updated_resume, 'ATS-guided improvement applied to the current draft.')
-        st.rerun()
     history = st.session_state.get('last_ats_improve_history', [])
     if history:
+        st.markdown('---')
         st.markdown('**Recent ATS improvement rounds**')
         for item in history:
             st.write(f"- Round {item.get('round')}: {item.get('before_score')} → {item.get('after_score')} ({item.get('mode')})")
