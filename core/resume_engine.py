@@ -515,6 +515,7 @@ def generate_resume_content(
     default_prompt: str = '',
     use_ai: bool = True,
     clean_generation: bool = True,
+    model: str = '',
 ) -> dict:
     job_tech_analysis = _analyze_job_tech_stack(job_description, target_role=target_role)
     api_key = os.getenv('OPENAI_API_KEY', '').strip()
@@ -549,6 +550,7 @@ def generate_resume_content(
                     validation_feedback=feedback,
                     flow_id=flow_id,
                     attempt=attempt,
+                    model=model,
                 )
                 resume = call_result['resume']
                 api_logs.append(call_result['api_log'])
@@ -603,6 +605,7 @@ def update_resume_content(
     use_ai: bool = True,
     clean_generation: bool = True,
     flow_id: str | None = None,
+    model: str = '',
 ) -> dict:
     current_resume = deepcopy(current_resume or {})
     api_key = os.getenv('OPENAI_API_KEY', '').strip()
@@ -620,6 +623,7 @@ def update_resume_content(
                 default_prompt=default_prompt,
                 clean_generation=clean_generation,
                 flow_id=effective_flow_id,
+                model=model,
             )
             api_logs.append(call_result['api_log'])
             return {'mode': 'openai-update', 'resume': call_result['resume'], 'api_logs': api_logs, 'flow_id': effective_flow_id}
@@ -672,6 +676,7 @@ def improve_resume_to_target_ats(
     default_prompt: str = '',
     use_ai: bool = True,
     clean_generation: bool = True,
+    model: str = '',
 ) -> dict:
     working_resume = deepcopy(current_resume or {})
     history: list[dict] = []
@@ -710,6 +715,7 @@ def improve_resume_to_target_ats(
             use_ai=use_ai,
             clean_generation=clean_generation,
             flow_id=flow_id,
+            model=model,
         )
         latest_mode = update_result.get('mode', latest_mode)
         api_logs.extend(update_result.get('api_logs', []) or [])
@@ -925,6 +931,7 @@ def generate_application_answers(
     questions: list[str],
     target_role: str = '',
     use_ai: bool = True,
+    model: str = '',
 ) -> dict:
     clean_questions = [str(question).strip() for question in questions if str(question).strip()]
     if not clean_questions:
@@ -934,7 +941,7 @@ def generate_application_answers(
     flow_id = _make_flow_id('application_answers')
     if use_ai and api_key:
         try:
-            call_result = _generate_answers_with_openai(resume, job_description, clean_questions, target_role, flow_id=flow_id)
+            call_result = _generate_answers_with_openai(resume, job_description, clean_questions, target_role, flow_id=flow_id, model=model)
             return {'mode': 'openai', 'answers': call_result['answers'], 'api_logs': [call_result['api_log']], 'flow_id': flow_id}
         except OpenAITraceError as exc:  # pragma: no cover
             answers = _generate_demo_answers(resume, job_description, clean_questions, target_role)
@@ -950,11 +957,11 @@ def generate_application_answers(
     return {'mode': 'demo', 'answers': _generate_demo_answers(resume, job_description, clean_questions, target_role), 'api_logs': [], 'flow_id': flow_id}
 
 
-def _generate_with_openai(profile: dict, job_description: str, target_role: str, custom_prompt: str, default_prompt: str, clean_generation: bool, job_tech_analysis: dict | None = None, validation_feedback: str = '', flow_id: str = '', attempt: int = 1) -> dict:
+def _generate_with_openai(profile: dict, job_description: str, target_role: str, custom_prompt: str, default_prompt: str, clean_generation: bool, job_tech_analysis: dict | None = None, validation_feedback: str = '', flow_id: str = '', attempt: int = 1, model: str = '') -> dict:
     from openai import OpenAI
 
     client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
-    model = os.getenv('OPENAI_MODEL', 'gpt-5.4')
+    model = model or os.getenv('OPENAI_MODEL', 'gpt-5.4')
 
     work_history_count = len(profile.get('work_history', []) or [])
     bullet_targets = ', '.join(
@@ -1018,11 +1025,11 @@ def _generate_with_openai(profile: dict, job_description: str, target_role: str,
     }
 
 
-def _update_with_openai(profile: dict, job_description: str, current_resume: dict, fix_prompt: str, target_role: str, custom_prompt: str, default_prompt: str, clean_generation: bool, flow_id: str = '') -> dict:
+def _update_with_openai(profile: dict, job_description: str, current_resume: dict, fix_prompt: str, target_role: str, custom_prompt: str, default_prompt: str, clean_generation: bool, flow_id: str = '', model: str = '') -> dict:
     from openai import OpenAI
 
     client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
-    model = os.getenv('OPENAI_MODEL', 'gpt-5.4')
+    model = model or os.getenv('OPENAI_MODEL', 'gpt-5.4')
 
     job_tech_analysis = _analyze_job_tech_stack(job_description, target_role=target_role)
     work_history_count = len(profile.get('work_history', []) or current_resume.get('work_history', []))
@@ -1161,11 +1168,11 @@ def _update_demo_resume(profile: dict, job_description: str, current_resume: dic
     return _normalize_resume(updated, profile=profile, target_role=inferred_title, job_description=job_description)
 
 
-def _generate_answers_with_openai(resume: dict, job_description: str, questions: list[str], target_role: str = '', flow_id: str = '') -> dict:
+def _generate_answers_with_openai(resume: dict, job_description: str, questions: list[str], target_role: str = '', flow_id: str = '', model: str = '') -> dict:
     from openai import OpenAI
 
     client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
-    model = os.getenv('OPENAI_MODEL', 'gpt-5.4')
+    model = model or os.getenv('OPENAI_MODEL', 'gpt-5.4')
 
     developer_message = (
         'You write short, strong job application answers grounded only in the provided resume and job description. '

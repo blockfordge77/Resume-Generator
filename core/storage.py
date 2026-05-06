@@ -43,8 +43,11 @@ DEFAULT_OPENAI_MODEL = 'gpt-5-nano'
 _URL_TRACKING_PARAMS = frozenset({
     'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
     'ref', 'source', 'src', 'referral', 'referer', 'fbclid', 'gclid',
-    'msclkid', 'yclid', 'mc_eid', 'trk', 'trkCampaign', 'sc_campaign',
+    'msclkid', 'yclid', 'mc_eid', 'trk', 'trkcampaign', 'sc_campaign',
     'icid', 'cid', 'sid', 'lid', 'pid', 'aid', 'eid', 'iid', 'rid',
+    'gh_src', 'gh_jid', 'lever-origin', 'lever-source',
+    'tracking_key', 'trackingid',
+    'jobboard', 'jobsource', 'channel',
 })
 
 

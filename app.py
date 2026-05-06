@@ -26,7 +26,7 @@ from core.resume_engine import (
     improve_resume_to_target_ats,
     update_resume_content,
 )
-from core.storage import Storage, build_password_record, verify_password
+from core.storage import Storage, build_password_record, verify_password, OPENAI_MODEL_OPTIONS
 
 load_dotenv()
 
@@ -186,6 +186,7 @@ def init_state() -> None:
         'last_job_region': 'ANY',
         'last_target_role': '',
         'last_custom_prompt': '',
+        'last_model': '',
         'last_bold_keywords': '',
         'last_auto_bold_fit_keywords': False,
         'last_update_prompt': '',
@@ -1719,7 +1720,37 @@ def dashboard_page(user: dict) -> None:
 
         target_role = st.text_input('Target role (optional)', value=st.session_state.get('last_target_role', ''), placeholder='Leave blank to let AI infer the best role from the job description')
         job_description = st.text_area('Job description', value=st.session_state.get('last_job_description', ''), height=330, placeholder='Paste the full job description here...')
-        custom_prompt = st.text_area('Custom resume prompt (optional)', value=st.session_state.get('last_custom_prompt', ''), height=110, placeholder='Example: Keep the resume sharply aligned to backend ownership, emphasize exact named tech stacks in each company bullet, and avoid generic wording.')
+
+        selected_model = ''
+        custom_prompt = ''
+        if is_admin(user):
+            saved_prompts = app_settings.get('saved_prompts', [])
+            prompt_options = ['— none —'] + [p['name'] for p in saved_prompts]
+            model_col, prompt_col = st.columns(2)
+            with model_col:
+                selected_model = st.selectbox(
+                    'Model',
+                    OPENAI_MODEL_OPTIONS,
+                    index=0,
+                    key='dashboard_model_select',
+                )
+            with prompt_col:
+                chosen_prompt_name = st.selectbox(
+                    'Prompt template',
+                    prompt_options,
+                    index=0,
+                    key='dashboard_prompt_select',
+                )
+            if chosen_prompt_name == '— none —':
+                custom_prompt = st.text_area(
+                    'Custom resume prompt (optional)',
+                    value=st.session_state.get('last_custom_prompt', ''),
+                    height=110,
+                    placeholder='Leave blank to use the default prompt only.',
+                )
+            else:
+                matched = next((p for p in saved_prompts if p['name'] == chosen_prompt_name), None)
+                custom_prompt = matched['text'] if matched else ''
 
         is_generating_resume = bool(st.session_state.get('dashboard_is_generating_resume', False))
         create_clicked = st.button(
@@ -1743,6 +1774,7 @@ def dashboard_page(user: dict) -> None:
                 'job_description': job_description,
                 'target_role': target_role,
                 'custom_prompt': custom_prompt,
+                'model': selected_model,
                 'use_ai': bool(use_ai),
                 'current_job_region': current_job_region,
                 'selected_job_id': selected_job.get('id', ''),
@@ -1763,6 +1795,7 @@ def dashboard_page(user: dict) -> None:
                         default_prompt=default_prompt,
                         use_ai=bool(inputs.get('use_ai', True)),
                         clean_generation=clean_generation,
+                        model=inputs.get('model', ''),
                     )
                     _record_openai_usage(result, 'generate_resume')
                     resume = result['resume']
@@ -1787,6 +1820,7 @@ def dashboard_page(user: dict) -> None:
                 st.session_state['last_target_role'] = inputs.get('target_role', '')
                 st.session_state['last_job_region'] = inputs.get('current_job_region', '')
                 st.session_state['last_custom_prompt'] = inputs.get('custom_prompt', '')
+                st.session_state['last_model'] = inputs.get('model', '')
                 st.session_state['last_bold_keywords'] = ''
                 st.session_state['last_auto_bold_fit_keywords'] = False
                 st.session_state['last_update_prompt'] = ''
@@ -1863,7 +1897,7 @@ def dashboard_page(user: dict) -> None:
                     message=(exports or {}).get('pdf_message', ''),
                 )
             with tab_objects['Edit & Fix']:
-                _edit_and_fix_tab(current_profile, current_template, st.session_state.get('last_job_description', ''), st.session_state.get('last_target_role', ''), st.session_state.get('last_custom_prompt', ''), default_prompt, use_ai, clean_generation)
+                _edit_and_fix_tab(current_profile, current_template, st.session_state.get('last_job_description', ''), st.session_state.get('last_target_role', ''), st.session_state.get('last_custom_prompt', ''), default_prompt, use_ai, clean_generation, model=st.session_state.get('last_model', ''))
             with tab_objects['Exports']:
                 st.markdown('**Download behavior**')
                 pdf_message = (st.session_state.get('last_exports') or {}).get('pdf_message', '')
@@ -1880,7 +1914,7 @@ def dashboard_page(user: dict) -> None:
                 if latest_saved:
                     st.caption(f'Latest saved resume id: {latest_saved}')
             with tab_objects['ATS Notes']:
-                _dashboard_ats_notes_tab(current_profile, current_template, resume, st.session_state.get('last_job_description', ''), st.session_state.get('last_target_role', ''), st.session_state.get('last_custom_prompt', ''), default_prompt, use_ai, clean_generation)
+                _dashboard_ats_notes_tab(current_profile, current_template, resume, st.session_state.get('last_job_description', ''), st.session_state.get('last_target_role', ''), st.session_state.get('last_custom_prompt', ''), default_prompt, use_ai, clean_generation, model=st.session_state.get('last_model', ''))
             if 'Job Application Answers' in tab_objects:
                 with tab_objects['Job Application Answers']:
                     _render_application_answers_tab(
@@ -1906,7 +1940,7 @@ def dashboard_page(user: dict) -> None:
 
 # ---------- Edit / fix ----------
 
-def _edit_and_fix_tab(profile: dict, template: dict, job_description: str, target_role: str, custom_prompt: str, default_prompt: str, use_ai: bool, clean_generation: bool) -> None:
+def _edit_and_fix_tab(profile: dict, template: dict, job_description: str, target_role: str, custom_prompt: str, default_prompt: str, use_ai: bool, clean_generation: bool, model: str = '') -> None:
     st.caption('Edit the current draft directly, then apply manual changes or send a fix request to OpenAI using the current draft as the starting point.')
     st.markdown('#### Manual draft editor')
     st.text_input('Headline', key='editor_headline')
@@ -1960,7 +1994,7 @@ def _edit_and_fix_tab(profile: dict, template: dict, job_description: str, targe
         current_draft['bold_keywords'] = (st.session_state.get('last_resume') or {}).get('bold_keywords', [])
         current_draft['auto_bold_fit_keywords'] = bool((st.session_state.get('last_resume') or {}).get('auto_bold_fit_keywords', False))
         with st.spinner('Updating current draft with OpenAI...'):
-            result = update_resume_content(profile=profile, job_description=job_description, current_resume=current_draft, fix_prompt=fix_prompt, target_role=target_role, custom_prompt=custom_prompt, default_prompt=default_prompt, use_ai=use_ai, clean_generation=clean_generation)
+            result = update_resume_content(profile=profile, job_description=job_description, current_resume=current_draft, fix_prompt=fix_prompt, target_role=target_role, custom_prompt=custom_prompt, default_prompt=default_prompt, use_ai=use_ai, clean_generation=clean_generation, model=model)
             _record_openai_usage(result, 'update_resume')
             updated_resume = result['resume']
             updated_resume['bold_keywords'] = current_draft.get('bold_keywords', [])
@@ -2089,19 +2123,68 @@ def app_settings_page(user: dict) -> None:
     show_header(user)
     st.subheader('App Settings')
     settings = storage.get_app_settings()
+
+    # ── General settings ──────────────────────────────────────────────────────
     with st.form('app_settings_form'):
-        default_prompt = st.text_area('Default prompt', value=settings.get('default_prompt', ''), height=220, placeholder='Default resume guidance that should apply to every generation...')
+        default_prompt = st.text_area('Default prompt', value=settings.get('default_prompt', ''), height=220, placeholder='Default resume guidance that applies to every generation...')
         download_output_dir = st.text_input('Server save folder (local desktop mode only)', value=settings.get('download_output_dir', 'saved_resumes'), help='Temporary DOCX/PDF files are created server-side before browser download.')
         pdf_backend_order = st.text_input('PDF backend order', value=settings.get('pdf_backend_order', 'docx2pdf, word, libreoffice, wps_custom'), help='Comma-separated. For Windows + WPS, configure wps_custom when docx2pdf/Word is unavailable.')
         wps_pdf_command = st.text_input('WPS custom PDF command', value=settings.get('wps_pdf_command', ''), help='Optional. Example: "C:\\Path\\to\\wps_export.bat" "{input}" "{output}"')
         submitted = st.form_submit_button('Save app settings', type='primary')
     if submitted:
-        storage.save_app_settings({'default_prompt': default_prompt.strip(), 'always_clean_generation': True, 'download_output_dir': download_output_dir.strip() or 'saved_resumes', 'pdf_backend_order': pdf_backend_order.strip() or 'docx2pdf, word, libreoffice, wps_custom', 'wps_pdf_command': wps_pdf_command.strip()})
+        current = storage.get_app_settings()
+        storage.save_app_settings({**current, 'default_prompt': default_prompt.strip(), 'always_clean_generation': True, 'download_output_dir': download_output_dir.strip() or 'saved_resumes', 'pdf_backend_order': pdf_backend_order.strip() or 'docx2pdf, word, libreoffice, wps_custom', 'wps_pdf_command': wps_pdf_command.strip()})
         st.success('App settings saved.')
         st.rerun()
     with st.expander('Detected PDF export backends'):
         for line in pdf_backend_status(_pdf_export_config(settings)):
             st.write(f'- {line}')
+
+    # ── Prompt library ────────────────────────────────────────────────────────
+    st.divider()
+    st.subheader('Prompt library')
+    st.caption('Saved prompts appear in the dashboard for admins to pick when generating a resume.')
+    saved_prompts: list[dict] = list(settings.get('saved_prompts', []))
+
+    def _save_prompts(prompts: list[dict]) -> None:
+        current = storage.get_app_settings()
+        storage.save_app_settings({**current, 'saved_prompts': prompts})
+
+    for idx, prompt in enumerate(saved_prompts):
+        pid = prompt.get('id', '')
+        with st.expander(prompt.get('name', f'Prompt {idx + 1}'), expanded=False):
+            with st.form(key=f'edit_prompt_{pid}'):
+                new_name = st.text_input('Name', value=prompt.get('name', ''), key=f'pname_{pid}')
+                new_text = st.text_area('Prompt text', value=prompt.get('text', ''), height=160, key=f'ptext_{pid}')
+                save_col, del_col = st.columns(2)
+                save_clicked = save_col.form_submit_button('Save', type='primary', use_container_width=True)
+                del_clicked = del_col.form_submit_button('Delete', use_container_width=True)
+            if save_clicked:
+                if not new_name.strip():
+                    st.error('Name is required.')
+                else:
+                    saved_prompts[idx] = {**prompt, 'name': new_name.strip(), 'text': new_text.strip()}
+                    _save_prompts(saved_prompts)
+                    st.success('Prompt saved.')
+                    st.rerun()
+            if del_clicked:
+                saved_prompts.pop(idx)
+                _save_prompts(saved_prompts)
+                st.rerun()
+
+    st.markdown('**Add new prompt**')
+    with st.form('add_prompt_form'):
+        add_name = st.text_input('Name', placeholder='e.g. Backend focused')
+        add_text = st.text_area('Prompt text', height=140, placeholder='Emphasize backend ownership, exact tech stacks...')
+        if st.form_submit_button('Add prompt', type='primary'):
+            if not add_name.strip():
+                st.error('Name is required.')
+            else:
+                import uuid as _uuid
+                new_prompt = {'id': f'prompt_{_uuid.uuid4().hex[:10]}', 'name': add_name.strip(), 'text': add_text.strip()}
+                _save_prompts(saved_prompts + [new_prompt])
+                st.success('Prompt added.')
+                st.rerun()
 
 
 def _profile_assignment_owner_map(users: list[dict], exclude_user_id: str = "") -> dict[str, str]:
@@ -3305,6 +3388,11 @@ def job_list_page(user: dict) -> None:
                         save_clicked = ec_save.form_submit_button('Save changes', type='primary', use_container_width=True)
                         cancel_clicked = ec_cancel.form_submit_button('Close', use_container_width=True)
                     if save_clicked:
+                        if ec_link.strip():
+                            url_dupe = storage.find_job_by_url(ec_link.strip(), exclude_job_id=job.get('id', ''))
+                            if url_dupe:
+                                st.error(f"This URL already exists: **{_job_summary_label(url_dupe)}**.")
+                                st.stop()
                         storage.update_job(job.get('id', ''), {
                             'company': ec_company,
                             'job_title': ec_title,
@@ -3331,12 +3419,17 @@ def job_list_page(user: dict) -> None:
                 region = st.selectbox('Job market', REGION_OPTIONS, index=REGION_OPTIONS.index('US'))
             description = st.text_area('Job description', height=220)
             note = st.text_area('Note', height=100)
-            confirm_duplicate = st.checkbox('I confirm I still want to add this if the same company and role already exist')
+            confirm_duplicate = st.checkbox('I confirm this is not a duplicate (same company + role exists)')
             submitted = st.form_submit_button('Add job', type='primary')
         if submitted:
-            duplicate = storage.find_duplicate_job(company, job_title)
-            if duplicate and not confirm_duplicate:
-                st.warning(f"A matching job already exists: {_job_summary_label(duplicate)}. Tick the confirmation box to add it anyway.")
+            if link.strip():
+                url_dupe = storage.find_job_by_url(link.strip())
+                if url_dupe:
+                    st.error(f"This URL already exists: **{_job_summary_label(url_dupe)}**. Edit that job instead.")
+                    return
+            title_dupe = storage.find_duplicate_job(company, job_title)
+            if title_dupe and not confirm_duplicate:
+                st.warning(f"A matching job already exists: **{_job_summary_label(title_dupe)}**. Tick the box above to add anyway.")
                 return
             status = 'approved' if is_admin(user) else 'pending'
             scrape_status = 'done' if description.strip() else ('queued' if link.strip() else 'done')
@@ -3956,7 +4049,7 @@ def _ats_notes_context_block(resume: dict) -> None:
             st.write(f"- {group.get('category', 'Other')}: {items}")
 
 
-def _dashboard_ats_notes_tab(profile: dict, template: dict, resume: dict, job_description: str, target_role: str, custom_prompt: str, default_prompt: str, use_ai: bool, clean_generation: bool) -> None:
+def _dashboard_ats_notes_tab(profile: dict, template: dict, resume: dict, job_description: str, target_role: str, custom_prompt: str, default_prompt: str, use_ai: bool, clean_generation: bool, model: str = '') -> None:
     if not str(job_description).strip():
         st.info('Add a job description to see ATS analysis.')
         return
@@ -3979,7 +4072,7 @@ def _dashboard_ats_notes_tab(profile: dict, template: dict, resume: dict, job_de
             st.error('Generate a resume first.')
             return
         with st.spinner('Improving the current draft against ATS guidance...'):
-            result = improve_resume_to_target_ats(profile=profile, job_description=job_description, current_resume=current_resume, target_score=int(target_score), max_rounds=int(max_rounds), additional_requirements=st.session_state.get('dashboard_ats_improve_prompt', ''), target_role=target_role, custom_prompt=custom_prompt, default_prompt=default_prompt, use_ai=use_ai, clean_generation=clean_generation)
+            result = improve_resume_to_target_ats(profile=profile, job_description=job_description, current_resume=current_resume, target_score=int(target_score), max_rounds=int(max_rounds), additional_requirements=st.session_state.get('dashboard_ats_improve_prompt', ''), target_role=target_role, custom_prompt=custom_prompt, default_prompt=default_prompt, use_ai=use_ai, clean_generation=clean_generation, model=model)
             _record_openai_usage_for_improve(result)
         updated_resume = result.get('resume', current_resume)
         exports = _build_uploaded_docx_pdf_exports(resume=updated_resume, profile=profile, app_settings=storage.get_app_settings())
