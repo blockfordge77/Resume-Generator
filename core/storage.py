@@ -268,6 +268,7 @@ def _normalize_user(item: dict) -> dict:
         'created_at': str(item.get('created_at', '')),
         'approved_at': str(item.get('approved_at', '')),
         'approved_by_user_id': str(item.get('approved_by_user_id', '')).strip(),
+        'parent_admin_id': str(item.get('parent_admin_id', '')).strip(),
         'force_password_change': bool(item.get('force_password_change', False)),
         'auth_tokens': _normalize_auth_tokens(item.get('auth_tokens', []) or []),
     }
@@ -549,9 +550,15 @@ class Storage:
                     job_compare_key=_job_compare_key,
                     normalize_url=normalize_job_url,
                 )
+            self._purge_disabled_users(session)
             self._ensure_default_templates(session)
             self._ensure_default_settings(session)
             self._ensure_default_admin(session)
+
+    @staticmethod
+    def _purge_disabled_users(session: Session) -> None:
+        for row in session.scalars(select(UserRow).where(UserRow.status == 'disabled')).all():
+            session.delete(row)
 
     @staticmethod
     def _ensure_default_templates(session: Session) -> None:
@@ -773,6 +780,10 @@ class Storage:
         if not normalized.get('username'):
             return
         with session_scope(self.db_path) as session:
+            existing = session.get(UserRow, normalized['id'])
+            # parent_admin_id is immutable once set
+            if existing is not None and existing.parent_admin_id and not normalized.get('parent_admin_id'):
+                normalized['parent_admin_id'] = existing.parent_admin_id
             session.merge(UserRow(
                 id=normalized['id'],
                 username=normalized['username'],
@@ -780,6 +791,7 @@ class Storage:
                 email=normalized['email'],
                 status=normalized['status'],
                 is_admin=normalized['is_admin'],
+                parent_admin_id=normalized.get('parent_admin_id', ''),
                 data=normalized,
             ))
 
@@ -791,12 +803,17 @@ class Storage:
             row = session.get(UserRow, uid)
             if row is None:
                 return
-            normalized = _normalize_user(dict(row.data or {}) | (patch or {}))
+            merged = dict(row.data or {}) | (patch or {})
+            # parent_admin_id is immutable once set
+            if row.parent_admin_id and not str(merged.get('parent_admin_id', '')).strip():
+                merged['parent_admin_id'] = row.parent_admin_id
+            normalized = _normalize_user(merged)
             row.data = normalized
             row.full_name = normalized['full_name']
             row.email = normalized['email']
             row.status = normalized['status']
             row.is_admin = normalized['is_admin']
+            row.parent_admin_id = normalized.get('parent_admin_id', '')
 
     def delete_user(self, user_id: str) -> None:
         uid = str(user_id or '').strip()

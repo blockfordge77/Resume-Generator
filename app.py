@@ -2140,6 +2140,61 @@ def _assigned_profile_help_text(selected_profiles: list[dict], owner_map: dict[s
     return 'Each profile can be assigned to only one user. Profiles already assigned to other users are hidden from this picker.'
 
 
+def _render_approved_user_row(member: dict, profiles: list[dict], users: list[dict], *, key_prefix: str) -> None:
+    member_id = str(member.get('id', '')).strip()
+    available_profiles, owner_map = _available_profiles_for_user_assignment(
+        profiles, users, member_id, member.get('assigned_profile_ids', [])
+    )
+    assigned = st.multiselect(
+        'Assigned profiles',
+        available_profiles,
+        default=[p for p in available_profiles if p.get('id') in (member.get('assigned_profile_ids', []) or [])],
+        format_func=_format_profile_option,
+        key=f'{key_prefix}_profiles_{member_id}',
+    )
+    st.caption(_assigned_profile_help_text(assigned, owner_map))
+    member_is_admin = st.checkbox(
+        'Admin user',
+        value=bool(member.get('is_admin', False)),
+        key=f'{key_prefix}_admin_{member_id}',
+    )
+    new_password = st.text_input(
+        'Reset password (optional)',
+        type='password',
+        key=f'{key_prefix}_password_{member_id}',
+    )
+    save_col, delete_col = st.columns([3, 1])
+    with save_col:
+        if st.button('Save user access', key=f'{key_prefix}_save_{member_id}', type='primary', use_container_width=True):
+            assigned_ids = [item.get('id') for item in assigned]
+            conflicting = [owner_map.get(str(profile_id)) for profile_id in assigned_ids if str(profile_id) in owner_map]
+            if conflicting:
+                st.error('One or more selected profiles are already assigned to another user. Refresh and choose only unassigned profiles.')
+                return
+            patch = {'assigned_profile_ids': assigned_ids, 'is_admin': member_is_admin, 'status': 'approved'}
+            if new_password.strip():
+                patch |= build_password_record(new_password.strip()) | {'force_password_change': False}
+            storage.update_user(member_id, patch)
+            st.success('User updated.')
+            st.rerun()
+    with delete_col:
+        confirm_key = f'{key_prefix}_confirm_delete_{member_id}'
+        if st.session_state.get(confirm_key):
+            yes, no = st.columns(2)
+            if yes.button('Yes', key=f'{key_prefix}_yes_delete_{member_id}', type='primary', use_container_width=True):
+                storage.delete_user(member_id)
+                st.session_state.pop(confirm_key, None)
+                st.success('User deleted.')
+                st.rerun()
+            if no.button('No', key=f'{key_prefix}_no_delete_{member_id}', use_container_width=True):
+                st.session_state.pop(confirm_key, None)
+                st.rerun()
+        else:
+            if st.button('Delete', key=f'{key_prefix}_delete_{member_id}', use_container_width=True):
+                st.session_state[confirm_key] = True
+                st.rerun()
+
+
 def _record_openai_usage(result: dict, kind: str) -> None:
     """Record detailed OpenAI usage logs for the current user when available."""
     mode = str((result or {}).get('mode', '')).strip().lower()
@@ -2635,7 +2690,14 @@ def user_access_page(user: dict) -> None:
                         if conflicting:
                             st.error('One or more selected profiles are already assigned to another user. Refresh and choose only unassigned profiles.')
                         else:
-                            storage.update_user(pending.get('id', ''), {'status': 'approved', 'is_admin': make_admin, 'assigned_profile_ids': assigned_ids, 'approved_at': datetime.utcnow().isoformat() + 'Z', 'approved_by_user_id': user.get('id', '')})
+                            storage.update_user(pending.get('id', ''), {
+                                'status': 'approved',
+                                'is_admin': make_admin,
+                                'assigned_profile_ids': assigned_ids,
+                                'approved_at': datetime.utcnow().isoformat() + 'Z',
+                                'approved_by_user_id': user.get('id', ''),
+                                'parent_admin_id': user.get('id', ''),
+                            })
                             st.success('User approved.')
                             st.rerun()
                 with c2:
@@ -2644,37 +2706,45 @@ def user_access_page(user: dict) -> None:
                         st.success('Pending request removed.')
                         st.rerun()
     with approved_tab:
-        page_approved_users, _ = _paginate_items(
-            approved_users,
-            page_key='user_access_approved',
-            per_page=10,
+        admins = sorted(
+            [m for m in approved_users if m.get('is_admin')],
+            key=lambda m: (m.get('full_name') or m.get('username') or '').lower(),
         )
-        for member in page_approved_users:
-            with st.expander(f"{member.get('full_name') or member.get('username')} • {'Admin' if member.get('is_admin') else 'User'}"):
-                available_profiles, owner_map = _available_profiles_for_user_assignment(profiles, users, member.get('id', ''), member.get('assigned_profile_ids', []))
-                assigned = st.multiselect(
-                    'Assigned profiles',
-                    available_profiles,
-                    default=[p for p in available_profiles if p.get('id') in (member.get('assigned_profile_ids', []) or [])],
-                    format_func=_format_profile_option,
-                    key=f"approved_profiles_{member.get('id')}"
-                )
-                st.caption(_assigned_profile_help_text(assigned, owner_map))
-                member_is_admin = st.checkbox('Admin user', value=bool(member.get('is_admin', False)), key=f"approved_admin_{member.get('id')}")
-                status = st.selectbox('Status', ['approved', 'disabled'], index=['approved', 'disabled'].index(member.get('status', 'approved') if member.get('status', 'approved') in ['approved', 'disabled'] else 'approved'), key=f"approved_status_{member.get('id')}")
-                new_password = st.text_input('Reset password (optional)', type='password', key=f"reset_password_{member.get('id')}")
-                if st.button('Save user access', key=f"save_user_{member.get('id')}", type='primary', use_container_width=True):
-                    assigned_ids = [item.get('id') for item in assigned]
-                    conflicting = [owner_map.get(str(profile_id)) for profile_id in assigned_ids if str(profile_id) in owner_map]
-                    if conflicting:
-                        st.error('One or more selected profiles are already assigned to another user. Refresh and choose only unassigned profiles.')
-                    else:
-                        patch = {'assigned_profile_ids': assigned_ids, 'is_admin': member_is_admin, 'status': status}
-                        if new_password.strip():
-                            patch |= build_password_record(new_password.strip()) | {'force_password_change': False}
-                        storage.update_user(member.get('id', ''), patch)
-                        st.success('User updated.')
-                        st.rerun()
+        bidders = [m for m in approved_users if not m.get('is_admin')]
+        bidders_by_admin: dict[str, list[dict]] = {}
+        admin_ids = {a.get('id', '') for a in admins}
+        for b in bidders:
+            parent = str(b.get('parent_admin_id', '')).strip()
+            key = parent if parent in admin_ids else ''
+            bidders_by_admin.setdefault(key, []).append(b)
+        for key in bidders_by_admin:
+            bidders_by_admin[key].sort(key=lambda m: (m.get('full_name') or m.get('username') or '').lower())
+
+        if not admins:
+            st.info('No admins yet.')
+
+        for admin in admins:
+            admin_id = admin.get('id', '')
+            owned = bidders_by_admin.get(admin_id, [])
+            label = f"{admin.get('full_name') or admin.get('username')}  •  Admin  •  {len(owned)} bidder{'s' if len(owned) != 1 else ''}"
+            with st.expander(label):
+                _render_approved_user_row(admin, profiles, users, key_prefix='admin')
+                if owned:
+                    st.markdown('---')
+                    st.caption(f'Bidders invited by {admin.get("full_name") or admin.get("username")}')
+                    for bidder in owned:
+                        with st.container(border=True):
+                            st.markdown(f"**{bidder.get('full_name') or bidder.get('username')}** &nbsp; `{bidder.get('username')}`")
+                            _render_approved_user_row(bidder, profiles, users, key_prefix='bidder')
+
+        orphans = bidders_by_admin.get('', [])
+        if orphans:
+            with st.expander(f"Unassigned bidders  •  {len(orphans)}"):
+                st.caption('These bidders predate the parent-admin tracking. Visible for audit only.')
+                for bidder in orphans:
+                    with st.container(border=True):
+                        st.markdown(f"**{bidder.get('full_name') or bidder.get('username')}** &nbsp; `{bidder.get('username')}`")
+                        _render_approved_user_row(bidder, profiles, users, key_prefix='orphan')
 
     with metrics_tab:
         _render_application_metrics_tab()

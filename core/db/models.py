@@ -73,6 +73,7 @@ class UserRow(Base):
     email: Mapped[str] = mapped_column(String(255), default='', index=True)
     status: Mapped[str] = mapped_column(String(32), default='pending', index=True)
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
+    parent_admin_id: Mapped[str] = mapped_column(String(64), default='', index=True)
     data: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)

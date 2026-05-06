@@ -185,6 +185,10 @@ def migrate(
 
     users_raw = _read_json(data_dir / 'users.json') or []
     if isinstance(users_raw, list):
+        # Two-pass import: first build the surviving (non-disabled, deduped) set
+        # so we can resolve parent_admin_id by checking which approver is itself
+        # an active admin in the surviving set.
+        survivors: list[dict] = []
         seen_usernames: set[str] = set()
         for raw in users_raw:
             if not isinstance(raw, dict):
@@ -192,16 +196,30 @@ def migrate(
             payload = normalize_user(raw)
             uid = str(payload.get('id', '')).strip()
             uname = str(payload.get('username', '')).strip().lower()
-            if not uid or not uname or uname in seen_usernames:
+            status = str(payload.get('status', 'pending')).strip()
+            if not uid or not uname or uname in seen_usernames or status == 'disabled':
                 continue
             seen_usernames.add(uname)
+            survivors.append(payload)
+
+        active_admin_ids = {
+            p['id'] for p in survivors
+            if bool(p.get('is_admin')) and str(p.get('status', '')).strip() == 'approved'
+        }
+
+        for payload in survivors:
+            uid = payload['id']
+            approver = str(payload.get('approved_by_user_id', '')).strip()
+            parent = approver if (approver and approver != uid and approver in active_admin_ids) else ''
+            payload['parent_admin_id'] = parent
             session.merge(UserRow(
                 id=uid,
-                username=uname,
+                username=str(payload.get('username', '')).strip().lower(),
                 full_name=str(payload.get('full_name', '')).strip(),
                 email=str(payload.get('email', '')).strip(),
                 status=str(payload.get('status', 'pending')).strip(),
                 is_admin=bool(payload.get('is_admin', False)),
+                parent_admin_id=parent,
                 data=payload,
             ))
             counts['users'] += 1
