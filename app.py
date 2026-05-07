@@ -2028,163 +2028,767 @@ def profile_settings_page(user: dict) -> None:
         st.error('Only admins can manage profiles.')
         return
     show_header(user)
-    st.subheader('Profiles')
-    profiles = storage.get_profiles()
-    profile_labels = [f"{p.get('name', 'Unnamed')} - {_profile_resume_status(p)}" for p in profiles]
-    mode = st.radio('Profile action', ['Edit existing', 'Create new'], horizontal=True)
-    if mode == 'Edit existing' and profiles:
-        selected_label = st.selectbox('Choose profile', profile_labels)
-        selected_index = profile_labels.index(selected_label)
-        selected_profile = profiles[selected_index]
-    else:
-        selected_profile = {'id': '', 'name': '', 'email': '', 'phone': '', 'location': '', 'region': 'ANY', 'linkedin': '', 'portfolio': '', 'summary_seed': '', 'technical_skills': [], 'work_history': [], 'education_history': [], 'uploaded_resume': {}}
 
-    upload_info = _resolved_uploaded_resume_record(selected_profile)
-    if _profile_has_uploaded_resume(selected_profile):
-        st.success(f"resume uploaded: {upload_info.get('filename', 'resume.docx')}")
-        with st.expander('Read uploaded resume template before generate', expanded=False):
-            _render_uploaded_resume_template_preview(selected_profile, storage.get_app_settings(), 'profile_settings_template_preview')
-    else:
-        st.warning('no resume so must upload resume')
+    _PROFILES_NEW_KEY = 'profiles_creating_new'
+    _PROFILES_SEL_KEY = 'profiles_selected_id'
+    _PNAV_OPEN_KEY    = 'pnav_open_admin'
 
-    with st.form('profile_form'):
-        c1, c2 = st.columns(2)
-        with c1:
-            name = st.text_input('Full name', value=selected_profile.get('name', ''))
-            email = st.text_input('Email', value=selected_profile.get('email', ''))
-            phone = st.text_input('Phone', value=selected_profile.get('phone', ''))
-        with c2:
-            location = st.text_input('Location', value=selected_profile.get('location', ''))
-            region = st.selectbox('Profile market', REGION_OPTIONS, index=REGION_OPTIONS.index(_region_label(selected_profile.get('region', 'ANY'))) if _region_label(selected_profile.get('region', 'ANY')) in REGION_OPTIONS else 0)
-            linkedin = st.text_input('LinkedIn', value=selected_profile.get('linkedin', ''))
-            portfolio = st.text_input('Portfolio / GitHub', value=selected_profile.get('portfolio', ''))
-        uploaded_resume = st.file_uploader('Upload resume DOCX', type=['docx'], help='Required. The generated PDF keeps this DOCX style and only replaces allowed resume content sections.')
-        st.caption('Only DOCX uploads are accepted. New profiles cannot be saved without a resume DOCX.')
-        skills_text = st.text_area('Technical skills (comma separated, optional helper for AI)', value=', '.join(selected_profile.get('technical_skills', [])), height=90)
-        summary_seed = st.text_area('About / summary seed (optional helper for AI)', value=selected_profile.get('summary_seed', ''), height=100)
-        st.markdown('### Work history helper data (optional)')
-        st.caption('The uploaded DOCX is the source style. These fields are optional AI helper data if you want stronger structured generation.')
-        work_history_text = st.text_area('Work history', value=_serialize_work_history(selected_profile.get('work_history', [])), height=220)
-        st.markdown('### Education history helper data (optional)')
-        education_text = st.text_area('Education history', value=_serialize_education_history(selected_profile.get('education_history', [])), height=120)
-        submitted = st.form_submit_button('Save profile', type='primary')
-    if submitted:
-        if not name.strip():
-            st.error('Profile name is required.')
-            return
-        existing_profile = _profile_name_conflict(name, selected_profile.get('id', ''))
-        if existing_profile:
-            st.error(f"Profile name already exists: {existing_profile.get('name', '').strip() or 'Unnamed profile'}. Use a different profile name.")
-            return
-        profile_id = selected_profile.get('id') or storage.make_id('profile')
-        uploaded_resume_record = copy.deepcopy(upload_info) if upload_info else {}
-        if uploaded_resume is not None:
-            try:
-                uploaded_resume_record = _save_uploaded_resume_docx(profile_id, uploaded_resume)
-            except Exception as exc:
-                st.error(str(exc))
-                return
-        resolved_existing_path = Path(str(uploaded_resume_record.get('path', ''))) if uploaded_resume_record.get('path') else None
-        if not uploaded_resume_record or not resolved_existing_path or not resolved_existing_path.exists():
-            st.error('no resume so must upload resume')
-            return
-        payload = {
-            'id': profile_id,
-            'name': name.strip(),
-            'email': email.strip(),
-            'phone': phone.strip(),
-            'location': location.strip(),
-            'region': _normalize_region(region),
-            'linkedin': linkedin.strip(),
-            'portfolio': portfolio.strip(),
-            'default_template_id': '',
-            'summary_seed': summary_seed.strip(),
-            'technical_skills': [item.strip() for item in skills_text.split(',') if item.strip()],
-            'work_history': _parse_work_history(work_history_text),
-            'education_history': _parse_education_history(education_text),
-            'uploaded_resume': uploaded_resume_record,
-        }
-        if not selected_profile.get('id'):
-            payload['created_by_user_id'] = str(user.get('id', '')).strip()
-            payload['created_by_username'] = str(user.get('username', '')).strip()
-        storage.upsert_profile(payload)
-        st.success('Profile saved.')
-        st.rerun()
-    if mode == 'Edit existing' and profiles:
-        if st.button('Delete selected profile'):
-            storage.delete_profile(selected_profile.get('id'))
-            st.success('Profile deleted.')
-            st.rerun()
+    current_uid = str(user.get('id', '')).strip()
+    superadmin  = _is_superadmin(user)
+
+    profiles  = storage.get_profiles()
+    all_users = storage.get_users()
+
+    # All approved admins — current admin first, then alpha
+    admins = [u for u in all_users if u.get('is_admin') and u.get('status') == 'approved']
+    admins.sort(key=lambda a: (
+        0 if str(a.get('id', '')) == current_uid else 1,
+        (a.get('full_name') or a.get('username') or '').lower(),
+    ))
+    admin_id_set = {str(a['id']) for a in admins}
+
+    def _admin_display(a: dict) -> str:
+        return a.get('full_name') or a.get('username') or str(a.get('id', ''))
+
+    def _profiles_for(aid: str) -> list[dict]:
+        return [p for p in profiles if str(p.get('created_by_user_id', '')).strip() == aid]
+
+    def _profile_nav_label(p: dict) -> str:
+        badge  = '✓' if _profile_has_uploaded_resume(p) else '✗'
+        region = _region_label(p.get('region', 'ANY'))
+        return f"{p.get('name', 'Unnamed')}  ·  {region}  {badge}"
+
+    def _can_edit_profile(p: dict) -> bool:
+        return superadmin or str(p.get('created_by_user_id', '')).strip() == current_uid
+
+    # Profiles whose owner isn't in the admin list → "orphan" section
+    orphan_profiles = [p for p in profiles if str(p.get('created_by_user_id', '')).strip() not in admin_id_set]
+    all_profile_ids = [p['id'] for p in profiles]
+
+    # ── State init ────────────────────────────────────────────────
+    if _PNAV_OPEN_KEY not in st.session_state:
+        st.session_state[_PNAV_OPEN_KEY] = current_uid
+
+    creating_new = st.session_state.get(_PROFILES_NEW_KEY, False)
+    sel_id       = st.session_state.get(_PROFILES_SEL_KEY)
+
+    if not creating_new and sel_id not in all_profile_ids:
+        first_mine = _profiles_for(current_uid)
+        sel_id = first_mine[0]['id'] if first_mine else (all_profile_ids[0] if all_profile_ids else None)
+        st.session_state[_PROFILES_SEL_KEY] = sel_id
+
+    sa_user  = next((u for u in all_users if str(u.get('id', '')).strip() == SUPERADMIN_USER_ID), None)
+    sa_label = (_admin_display(sa_user)) if sa_user else 'SuperAdmin'
+
+    # ── CSS ───────────────────────────────────────────────────────
+    st.markdown("""
+    <style>
+    /* ── 1. Zero internal gaps inside nav ──────────────────────────── */
+    div[class*="st-key-profiles-nav"] [data-testid="stVerticalBlock"] {
+        gap: 0 !important;
+        row-gap: 0 !important;
+    }
+
+    /* ── 2. Section card — IDENTICAL to Streamlit expander ─────────── */
+    div[class*="st-key-pnav-section-"] {
+        border: 1px solid rgba(255,255,255,0.12) !important;
+        border-radius: 8px !important;
+        padding: 0 !important;                          /* NO internal padding */
+        margin-bottom: 8px !important;
+        background: rgba(255,255,255,0.02) !important;
+        overflow: hidden !important;                    /* clips children to rounded corners */
+        transition: border-color 0.15s, background 0.15s !important;
+    }
+    div[class*="st-key-pnav-section-closed-"]:hover {
+        border-color: rgba(255,255,255,0.22) !important;
+        background: rgba(255,255,255,0.04) !important;
+    }
+    div[class*="st-key-pnav-section-open-"] {
+        border-color: rgba(255,255,255,0.18) !important;
+        background: rgba(255,255,255,0.025) !important;
+    }
+
+    /* ── 3. Header button — exact match to Streamlit expander summary ── */
+    div[class*="st-key-pnav-section-"] [data-testid^="stBaseButton-secondary"] {
+        background: transparent !important;
+        border: none !important;
+        border-radius: 0 !important;
+        padding: 0.75rem 1rem !important;               /* expander summary padding */
+        font-size: 1rem !important;                     /* expander default body size */
+        font-weight: 400 !important;                    /* expander uses normal weight */
+        color: rgba(250,250,250,0.95) !important;       /* default body text in dark mode */
+        height: auto !important;
+        min-height: 0 !important;
+        width: 100% !important;
+        display: flex !important;
+        justify-content: flex-start !important;
+        align-items: center !important;
+        line-height: 1.6 !important;
+    }
+    div[class*="st-key-pnav-section-"] [data-testid^="stBaseButton-secondary"]:hover {
+        background: rgba(255,255,255,0.04) !important;
+    }
+    /* Open header — bottom divider separating header from content */
+    div[class*="st-key-pnav-section-open-"] [data-testid^="stBaseButton-secondary"] {
+        border-bottom: 1px solid rgba(255,255,255,0.08) !important;
+    }
+
+    /* ── 4. FORCE button text left-aligned — REAL DOM is button>div>span>div>p */
+    div[class*="st-key-pnav-section-"] [data-testid^="stBaseButton-secondary"] > div {
+        width: 100% !important;
+        text-align: left !important;
+        justify-content: flex-start !important;
+    }
+    /* The MISSING selector: Streamlit wraps text in a <span> with display:inline by default */
+    div[class*="st-key-pnav-section-"] [data-testid^="stBaseButton-secondary"] > div > span {
+        display: block !important;
+        width: 100% !important;
+        text-align: left !important;
+    }
+    div[class*="st-key-pnav-section-"] [data-testid^="stBaseButton-secondary"] [data-testid="stMarkdownContainer"] {
+        width: 100% !important;
+        text-align: left !important;
+    }
+    div[class*="st-key-pnav-section-"] [data-testid^="stBaseButton-secondary"] p {
+        width: 100% !important;
+        text-align: left !important;
+        margin: 0 !important;
+    }
+
+    /* ── 5. Radio — KILL the fit-content on stElementContainer ─────── */
+    /* THE actual root cause: Streamlit sets width="fit-content" on the wrapper */
+    div[class*="st-key-pnav-section-open-"] [data-testid="stElementContainer"] {
+        width: 100% !important;
+    }
+    div[class*="st-key-profiles-nav"] [data-testid="stRadio"] {
+        margin: 0.3rem 0 0.1rem 0 !important;
+        padding: 0 !important;
+        border: none !important;
+        background: transparent !important;
+        width: 100% !important;
+    }
+    div[class*="st-key-profiles-nav"] [data-testid="stRadio"] > div,
+    div[class*="st-key-profiles-nav"] [data-testid="stRadio"] [role="radiogroup"] {
+        width: 100% !important;
+        gap: 1px !important;
+    }
+    /* Hide the radio's own widget label (uncollapsed by Streamlit even with label_visibility) */
+    div[class*="st-key-profiles-nav"] [data-testid="stRadio"] [data-testid="stWidgetLabel"] {
+        display: none !important;
+    }
+    div[class*="st-key-profiles-nav"] [data-testid="stRadio"] [role="radiogroup"] > label {
+        display: flex !important;
+        width: 100% !important;
+        box-sizing: border-box !important;
+        align-items: center !important;
+        padding: 0.3rem 0.55rem 0.3rem 1.6rem !important;   /* INDENTED to show child of admin */
+        margin: 0 !important;
+        border-radius: 5px !important;
+        font-size: 0.84rem !important;                      /* SMALLER than admin header */
+        font-weight: 400 !important;
+        cursor: pointer !important;
+        transition: background 0.1s !important;
+    }
+    div[class*="st-key-profiles-nav"] [data-testid="stRadio"] [role="radiogroup"] > label:hover {
+        background: rgba(255,255,255,0.06) !important;
+    }
+    div[class*="st-key-profiles-nav"] [data-testid="stRadio"] [role="radiogroup"] > label > div:last-child {
+        flex: 1 1 auto !important;
+        min-width: 0 !important;
+    }
+
+    /* ── 6. Empty state — indented, breathing room from card border ── */
+    div[class*="st-key-pnav-empty-"] {
+        padding: 0.55rem 0.55rem 0.55rem 1.6rem !important;
+        margin: 0.25rem 0 0.15rem 0 !important;
+    }
+    div[class*="st-key-pnav-empty-"] p {
+        font-size: 0.82rem !important;
+        opacity: 0.5 !important;
+        margin: 0 !important;
+        font-style: italic !important;
+    }
+
+    /* ── 7. New profile — compact ghost button (80% height) ────────── */
+    div[class*="st-key-pnav-newbtn-"] {
+        margin: 0.45rem 0.5rem 0.5rem 0.5rem !important;    /* small inset matching radio panel padding */
+    }
+    div[class*="st-key-pnav-newbtn-"] [data-testid^="stBaseButton-secondary"] {
+        background: rgba(99,102,241,0.1) !important;
+        border: 1px solid rgba(99,102,241,0.3) !important;
+        border-radius: 6px !important;
+        color: rgba(175,180,255,0.95) !important;
+        font-size: 0.81rem !important;
+        font-weight: 500 !important;
+        padding: 0.18rem 0.75rem !important;                /* reduced */
+        width: 100% !important;
+        height: auto !important;
+        min-height: 1.6rem !important;                      /* 80% of 2rem */
+        display: flex !important;
+        justify-content: center !important;
+        align-items: center !important;
+    }
+    div[class*="st-key-pnav-newbtn-"] [data-testid^="stBaseButton-secondary"]:hover {
+        background: rgba(99,102,241,0.18) !important;
+        border-color: rgba(99,102,241,0.45) !important;
+        color: rgba(200,205,255,1) !important;
+    }
+    /* New profile text — center it (override the left-align rule above) */
+    div[class*="st-key-pnav-newbtn-"] [data-testid^="stBaseButton-secondary"] > div,
+    div[class*="st-key-pnav-newbtn-"] [data-testid^="stBaseButton-secondary"] > div > span,
+    div[class*="st-key-pnav-newbtn-"] [data-testid^="stBaseButton-secondary"] [data-testid="stMarkdownContainer"],
+    div[class*="st-key-pnav-newbtn-"] [data-testid^="stBaseButton-secondary"] p {
+        text-align: center !important;
+        justify-content: center !important;
+    }
+
+    /* 10. Right-panel header card — neutral, matches expander aesthetic */
+    div[class*="st-key-profile-header-card"] {
+        border: 1px solid rgba(255,255,255,0.12) !important;
+        border-radius: 8px !important;
+        padding: 0.9rem 1.1rem !important;
+        margin-bottom: 0.7rem !important;
+        background: rgba(255,255,255,0.02) !important;
+    }
+    /* Preview expander — breathing room below header card */
+    div[class*="st-key-profile-preview-block"] {
+        margin-bottom: 1rem !important;
+    }
+    div[class*="st-key-profile-preview-block"] [data-testid="stExpander"] {
+        border-radius: 8px !important;
+    }
+    /* Title row — flex guarantees vertical centering. Real DOM wraps h3 in stHeadingWithActionElements */
+    .profile-title-row {
+        display: flex !important;
+        align-items: center !important;
+        justify-content: space-between !important;
+        gap: 1rem !important;
+        width: 100%;
+    }
+    /* Streamlit auto-wraps h3 — kill its padding and remove the anchor-link icon */
+    .profile-title-row [data-testid="stHeadingWithActionElements"] {
+        margin: 0 !important;
+        padding: 0 !important;
+        flex: 1 1 auto;
+        min-width: 0;
+    }
+    .profile-title-row [data-testid="stHeaderActionElements"] {
+        display: none !important;
+    }
+    .profile-title {
+        margin: 0 !important;
+        padding: 0 !important;
+        font-size: 1.3rem !important;
+        font-weight: 600 !important;
+        color: rgba(235,238,255,0.98) !important;
+        line-height: 1.3 !important;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+    .profile-tags {
+        flex: 0 0 auto;
+        display: flex;
+        align-items: center;
+        white-space: nowrap;
+    }
+    /* Owner reassign row (super admin only) */
+    .owner-row-divider {
+        height: 1px;
+        background: rgba(255,255,255,0.08);
+        margin: 0.7rem 0 0.6rem 0;
+    }
+    .owner-row-label {
+        font-size: 0.78rem;
+        font-weight: 500;
+        color: rgba(200,205,225,0.75);
+        margin-bottom: 0.35rem;
+        letter-spacing: 0.02em;
+        text-transform: uppercase;
+    }
+    div[class*="st-key-profile-owner-row"] [data-testid="stSelectbox"] label {
+        display: none !important;
+    }
+    .profile-meta-tag {
+        display: inline-block;
+        padding: 0.18rem 0.55rem;
+        background: rgba(255,255,255,0.05);
+        border: 1px solid rgba(255,255,255,0.14);
+        border-radius: 11px;
+        font-size: 0.72rem;
+        font-weight: 500;
+        color: rgba(200,205,230,0.9);
+        letter-spacing: 0.02em;
+        margin-left: 0.4rem;
+        line-height: 1.4;
+    }
+    .profile-meta-tag.warn {
+        background: rgba(255,180,90,0.1);
+        border-color: rgba(255,180,90,0.32);
+        color: rgba(255,210,150,0.9);
+    }
+    .profile-meta-tag.ok {
+        background: rgba(80,200,140,0.1);
+        border-color: rgba(80,200,140,0.32);
+        color: rgba(140,230,180,0.9);
+    }
+    .profile-readonly-banner {
+        margin-top: 0.75rem;
+        padding: 0.55rem 0.85rem;
+        background: rgba(255,180,90,0.07);
+        border-left: 3px solid rgba(255,180,90,0.55);
+        border-radius: 4px;
+        font-size: 0.83rem;
+        color: rgba(255,210,165,0.95);
+    }
+
+    /* 11. Detail form inputs */
+    div[class*="st-key-profiles-detail"] [data-testid="stTextInput"] input,
+    div[class*="st-key-profiles-detail"] [data-baseweb="textarea"] textarea {
+        border-radius: 6px !important;
+    }
+    div[class*="st-key-profiles-detail"] [data-testid="stTextInput"] input:disabled,
+    div[class*="st-key-profiles-detail"] [data-baseweb="textarea"] textarea:disabled,
+    div[class*="st-key-profiles-detail"] select:disabled {
+        opacity: 0.45 !important;
+        cursor: not-allowed !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # ── Layout ────────────────────────────────────────────────────
+    with st.container(key='profiles-outer'):
+        outer = st.columns([2, 8, 2])
+        with outer[1]:
+            left, right = st.columns([3, 7], gap='large')
+
+            # ── Left: accordion tree ──────────────────────────────
+            with left:
+                with st.container(key='profiles-nav'):
+                    open_aid = st.session_state.get(_PNAV_OPEN_KEY)
+
+                    # Render one section per admin
+                    sections: list[tuple[str, str, list[dict], bool]] = [
+                        (str(a['id']), _admin_display(a) + ('  (you)' if str(a['id']) == current_uid else ''), _profiles_for(str(a['id'])), str(a['id']) == current_uid)
+                        for a in admins
+                    ]
+                    # Orphan section appended if needed
+                    if orphan_profiles:
+                        sections.append(('__orphan__', sa_label, orphan_profiles, False))
+
+                    for (aid, label, sec_profiles, is_mine) in sections:
+                        is_open = open_aid == aid
+                        arrow   = '▾' if is_open else '▸'
+                        state   = 'open' if is_open else 'closed'
+
+                        with st.container(key=f'pnav-section-{state}-{aid}'):
+                            if st.button(f'{arrow}  {label}', key=f'pnavhdr_{aid}', width='stretch'):
+                                st.session_state[_PNAV_OPEN_KEY] = None if is_open else aid
+                                st.rerun()
+
+                            if is_open:
+                                sec_ids = [p['id'] for p in sec_profiles]
+                                if sec_ids:
+                                    radio_idx = (
+                                        sec_ids.index(sel_id)
+                                        if (sel_id and sel_id in sec_ids and not creating_new)
+                                        else None
+                                    )
+                                    chosen = st.radio(
+                                        'profiles',
+                                        sec_ids,
+                                        index=radio_idx,
+                                        format_func=lambda pid, _s=sec_profiles: _profile_nav_label(
+                                            next((p for p in _s if p['id'] == pid), {})
+                                        ),
+                                        label_visibility='collapsed',
+                                        key=f'psel_{aid}',
+                                        width='stretch',
+                                    )
+                                    if chosen is not None and (chosen != sel_id or creating_new):
+                                        st.session_state[_PROFILES_SEL_KEY] = chosen
+                                        st.session_state[_PROFILES_NEW_KEY] = False
+                                        st.rerun()
+                                else:
+                                    with st.container(key=f'pnav-empty-{aid}'):
+                                        st.caption('No profiles yet.')
+
+                                if is_mine:
+                                    with st.container(key=f'pnav-newbtn-{aid}'):
+                                        if st.button('＋  New profile', key='profiles_new_btn', width='stretch'):
+                                            st.session_state[_PROFILES_NEW_KEY] = True
+                                            st.session_state[_PROFILES_SEL_KEY] = None
+                                            st.rerun()
+
+            # ── Right: detail / form ────────────────────────────────────
+            with right:
+                with st.container(key='profiles-detail'):
+                    # ── State resolution ──
+                    if creating_new:
+                        selected_profile = {
+                            'id': '', 'name': '', 'email': '', 'phone': '',
+                            'location': '', 'region': 'ANY', 'linkedin': '',
+                            'portfolio': '', 'summary_seed': '',
+                            'technical_skills': [], 'work_history': [],
+                            'education_history': [], 'uploaded_resume': {},
+                            'created_by_user_id': current_uid,
+                        }
+                        can_edit = True
+                        is_new = True
+                        profile_title = 'New Profile'
+                        owner_name = ''
+                    else:
+                        selected_profile = next((p for p in profiles if p.get('id') == sel_id), None)
+                        if selected_profile is None:
+                            st.info('Select a profile from the list or create a new one.')
+                            return
+                        can_edit = _can_edit_profile(selected_profile)
+                        owner_uid = str(selected_profile.get('created_by_user_id', '')).strip()
+                        owner_user = next((u for u in all_users if str(u.get('id', '')).strip() == owner_uid), None)
+                        owner_name = (owner_user.get('full_name') or owner_user.get('username') or 'another admin') if owner_user else 'another admin'
+                        is_new = False
+                        profile_title = selected_profile.get('name', 'Unnamed') or 'Unnamed'
+
+                    upload_info = _resolved_uploaded_resume_record(selected_profile)
+                    has_resume  = _profile_has_uploaded_resume(selected_profile)
+                    region_text = _region_label(selected_profile.get('region', 'ANY'))
+
+                    # ── Header card (matches expander aesthetic) ──
+                    with st.container(key='profile-header-card'):
+                        # Title + tags — single flex row, guaranteed vertical centering
+                        tags = [f'<span class="profile-meta-tag">{region_text}</span>']
+                        if not is_new:
+                            tags.append(
+                                '<span class="profile-meta-tag ok">✓ Resume</span>'
+                                if has_resume
+                                else '<span class="profile-meta-tag warn">⚠ No resume</span>'
+                            )
+                        st.markdown(
+                            f'<div class="profile-title-row">'
+                            f'<h3 class="profile-title">{profile_title}</h3>'
+                            f'<div class="profile-tags">{"".join(tags)}</div>'
+                            f'</div>',
+                            unsafe_allow_html=True,
+                        )
+
+                        # Read-only banner (regular admin viewing other's profile)
+                        if not is_new and not can_edit:
+                            st.markdown(
+                                f'<div class="profile-readonly-banner">🔒 Read-only — owned by <b>{owner_name}</b>. Only that admin or the Superadmin can edit.</div>',
+                                unsafe_allow_html=True,
+                            )
+
+                        # Owner reassign — super admin only, existing profile
+                        if superadmin and not is_new and selected_profile.get('id'):
+                            st.markdown('<div class="owner-row-divider"></div>', unsafe_allow_html=True)
+                            st.markdown('<div class="owner-row-label">Profile Owner</div>', unsafe_allow_html=True)
+                            with st.container(key='profile-owner-row'):
+                                admin_id_options = [str(a['id']) for a in admins]
+                                current_owner_idx = (
+                                    admin_id_options.index(owner_uid)
+                                    if owner_uid in admin_id_options
+                                    else 0
+                                )
+                                sel_col, btn_col = st.columns([3, 1.2], vertical_alignment='center')
+                                with sel_col:
+                                    target_owner_id = st.selectbox(
+                                        'owner',
+                                        options=admin_id_options,
+                                        index=current_owner_idx,
+                                        format_func=lambda aid: next(
+                                            (_admin_display(a) for a in admins if str(a['id']) == aid),
+                                            aid,
+                                        ),
+                                        key=f'pownersel_{selected_profile["id"]}',
+                                        label_visibility='collapsed',
+                                    )
+                                with btn_col:
+                                    is_changed = (target_owner_id != owner_uid)
+                                    if st.button(
+                                        'Reassign',
+                                        disabled=not is_changed,
+                                        width='stretch',
+                                        key=f'reassign_btn_{selected_profile["id"]}',
+                                        type='primary' if is_changed else 'secondary',
+                                    ):
+                                        new_owner_user = next(
+                                            (u for u in all_users if str(u.get('id', '')).strip() == target_owner_id),
+                                            {},
+                                        )
+                                        storage.upsert_profile({
+                                            **selected_profile,
+                                            'created_by_user_id': target_owner_id,
+                                            'created_by_username': str(new_owner_user.get('username', '')),
+                                        })
+                                        st.success(f'Reassigned to {_admin_display(new_owner_user)}.')
+                                        st.rerun()
+
+                    # ── Preview / warning — OUTSIDE the header card with margin ──
+                    if has_resume:
+                        with st.container(key='profile-preview-block'):
+                            with st.expander(f'Preview resume template — {upload_info.get("filename", "resume.docx")}', expanded=False):
+                                _render_uploaded_resume_template_preview(selected_profile, storage.get_app_settings(), 'profile_settings_template_preview')
+                    elif not is_new:
+                        st.warning('No resume uploaded yet — required before generating.')
+
+                    with st.form('profile_form'):
+                        st.markdown('**Basic info**')
+                        r1c1, r1c2, r1c3 = st.columns(3)
+                        with r1c1:
+                            name = st.text_input('Full name', value=selected_profile.get('name', ''), disabled=not can_edit)
+                        with r1c2:
+                            email = st.text_input('Email', value=selected_profile.get('email', ''), disabled=not can_edit)
+                        with r1c3:
+                            phone = st.text_input('Phone', value=selected_profile.get('phone', ''), disabled=not can_edit)
+
+                        r2c1, r2c2, r2c3 = st.columns(3)
+                        with r2c1:
+                            location = st.text_input('Location', value=selected_profile.get('location', ''), disabled=not can_edit)
+                        with r2c2:
+                            region_label_val = _region_label(selected_profile.get('region', 'ANY'))
+                            region = st.selectbox('Market', REGION_OPTIONS, index=REGION_OPTIONS.index(region_label_val) if region_label_val in REGION_OPTIONS else 0, disabled=not can_edit)
+                        with r2c3:
+                            linkedin = st.text_input('LinkedIn', value=selected_profile.get('linkedin', ''), disabled=not can_edit)
+
+                        portfolio = st.text_input('Portfolio / GitHub', value=selected_profile.get('portfolio', ''), disabled=not can_edit)
+
+                        st.markdown('**Resume DOCX**')
+                        if can_edit:
+                            uploaded_resume = st.file_uploader('Upload resume DOCX', type=['docx'], label_visibility='collapsed', help='DOCX only. Generated PDF preserves this style.')
+                            st.caption('Only DOCX accepted. New profiles require a resume DOCX before saving.')
+                        else:
+                            st.caption('Resume DOCX — read-only.')
+                            uploaded_resume = None
+
+                        st.markdown('**AI helper data** *(optional)*')
+                        skills_text = st.text_area('Technical skills (comma-separated)', value=', '.join(selected_profile.get('technical_skills', [])), height=68, disabled=not can_edit)
+                        summary_seed = st.text_area('About / summary seed', value=selected_profile.get('summary_seed', ''), height=80, disabled=not can_edit)
+
+                        with st.expander('Work history', expanded=False):
+                            st.caption('Structured helper data for stronger AI generation. The DOCX is the style source.')
+                            work_history_text = st.text_area('Work history', value=_serialize_work_history(selected_profile.get('work_history', [])), height=200, label_visibility='collapsed', disabled=not can_edit)
+
+                        with st.expander('Education history', expanded=False):
+                            education_text = st.text_area('Education history', value=_serialize_education_history(selected_profile.get('education_history', [])), height=100, label_visibility='collapsed', disabled=not can_edit)
+
+                        if can_edit:
+                            save_col, del_col = st.columns([3, 1])
+                            submitted = save_col.form_submit_button('Save profile', type='primary', use_container_width=True)
+                            delete_clicked = del_col.form_submit_button('Delete', use_container_width=True, disabled=not selected_profile.get('id'))
+                        else:
+                            submitted = False
+                            delete_clicked = False
+                            st.form_submit_button('Read-only', disabled=True, use_container_width=False)
+
+                    if submitted:
+                        if not name.strip():
+                            st.error('Full name is required.')
+                            return
+                        existing_profile = _profile_name_conflict(name, selected_profile.get('id', ''))
+                        if existing_profile:
+                            st.error(f"Name already in use: {existing_profile.get('name', '').strip()}. Choose a different name.")
+                            return
+                        profile_id = selected_profile.get('id') or storage.make_id('profile')
+                        uploaded_resume_record = copy.deepcopy(upload_info) if upload_info else {}
+                        if uploaded_resume is not None:
+                            try:
+                                uploaded_resume_record = _save_uploaded_resume_docx(profile_id, uploaded_resume)
+                            except Exception as exc:
+                                st.error(str(exc))
+                                return
+                        resolved_existing_path = Path(str(uploaded_resume_record.get('path', ''))) if uploaded_resume_record.get('path') else None
+                        if not uploaded_resume_record or not resolved_existing_path or not resolved_existing_path.exists():
+                            st.error('Resume DOCX is required.')
+                            return
+                        payload = {
+                            'id': profile_id,
+                            'name': name.strip(),
+                            'email': email.strip(),
+                            'phone': phone.strip(),
+                            'location': location.strip(),
+                            'region': _normalize_region(region),
+                            'linkedin': linkedin.strip(),
+                            'portfolio': portfolio.strip(),
+                            'default_template_id': '',
+                            'summary_seed': summary_seed.strip(),
+                            'technical_skills': [s.strip() for s in skills_text.split(',') if s.strip()],
+                            'work_history': _parse_work_history(work_history_text),
+                            'education_history': _parse_education_history(education_text),
+                            'uploaded_resume': uploaded_resume_record,
+                        }
+                        if not selected_profile.get('id'):
+                            payload['created_by_user_id'] = current_uid
+                            payload['created_by_username'] = str(user.get('username', '')).strip()
+                        storage.upsert_profile(payload)
+                        st.session_state[_PROFILES_NEW_KEY] = False
+                        st.session_state[_PROFILES_SEL_KEY] = profile_id
+                        st.success('Profile saved.')
+                        st.rerun()
+
+                    if delete_clicked and selected_profile.get('id'):
+                        storage.delete_profile(selected_profile.get('id'))
+                        st.session_state[_PROFILES_NEW_KEY] = False
+                        st.session_state[_PROFILES_SEL_KEY] = None
+                        st.rerun()
 
 def app_settings_page(user: dict) -> None:
     if not is_admin(user):
         st.error('Only admins can manage app settings.')
         return
     show_header(user)
-    st.subheader('Settings')
     settings = storage.get_app_settings()
 
-    # ── General settings ──────────────────────────────────────────────────────
-    with st.form('app_settings_form'):
-        default_prompt = st.text_area('Default prompt', value=settings.get('default_prompt', ''), height=220, placeholder='Default resume guidance that applies to every generation...')
-        download_output_dir = st.text_input('Server save folder (local desktop mode only)', value=settings.get('download_output_dir', 'saved_resumes'), help='Temporary DOCX/PDF files are created server-side before browser download.')
-        pdf_backend_order = st.text_input('PDF backend order', value=settings.get('pdf_backend_order', 'docx2pdf, word, libreoffice, wps_custom'), help='Comma-separated. For Windows + WPS, configure wps_custom when docx2pdf/Word is unavailable.')
-        wps_pdf_command = st.text_input('WPS custom PDF command', value=settings.get('wps_pdf_command', ''), help='Optional. Example: "C:\\Path\\to\\wps_export.bat" "{input}" "{output}"')
-        submitted = st.form_submit_button('Save app settings', type='primary')
-    if submitted:
-        current = storage.get_app_settings()
-        storage.save_app_settings({**current, 'default_prompt': default_prompt.strip(), 'always_clean_generation': True, 'download_output_dir': download_output_dir.strip() or 'saved_resumes', 'pdf_backend_order': pdf_backend_order.strip() or 'docx2pdf, word, libreoffice, wps_custom', 'wps_pdf_command': wps_pdf_command.strip()})
-        st.success('App settings saved.')
-        st.rerun()
-    with st.expander('Detected PDF export backends'):
-        for line in pdf_backend_status(_pdf_export_config(settings)):
-            st.write(f'- {line}')
+    st.markdown("""
+    <style>
+    div[class*="st-key-settings-outer"] > div > div > div { gap: 0 !important; }
+    div[class*="st-key-settings-section"] {
+        border: 1px solid rgba(128,128,128,0.2);
+        border-radius: 10px;
+        padding: 1.4rem 1.6rem 1.2rem;
+        margin-bottom: 1.25rem;
+        background: rgba(128,128,128,0.03);
+    }
+    div[class*="st-key-settings-section"] h4 {
+        margin: 0 0 0.25rem 0;
+        font-size: 1rem;
+        font-weight: 600;
+        letter-spacing: 0.01em;
+    }
+    div[class*="st-key-settings-section"] .section-caption {
+        font-size: 0.82rem;
+        color: rgba(128,128,128,0.85);
+        margin-bottom: 1rem;
+        margin-top: 0;
+    }
+    div[class*="st-key-settings-outer"] .stTextInput label,
+    div[class*="st-key-settings-outer"] .stTextArea label {
+        font-size: 0.85rem;
+        font-weight: 500;
+    }
+    div[class*="st-key-prompt-item"] {
+        border: 1px solid rgba(128,128,128,0.18);
+        border-radius: 8px;
+        padding: 0.9rem 1rem 0.7rem;
+        margin-bottom: 0.6rem;
+        background: rgba(128,128,128,0.02);
+    }
+    div[class*="st-key-prompt-add"] {
+        border: 1px dashed rgba(128,128,128,0.3);
+        border-radius: 8px;
+        padding: 1rem 1rem 0.8rem;
+        margin-top: 0.5rem;
+    }
+    </style>
+    """, unsafe_allow_html=True)
 
-    # ── Prompt library ────────────────────────────────────────────────────────
-    st.divider()
-    st.subheader('Prompt library')
-    st.caption('Saved prompts appear in the dashboard for admins to pick when generating a resume.')
-    saved_prompts: list[dict] = list(settings.get('saved_prompts', []))
+    with st.container(key='settings-outer'):
+        outer = st.columns([2, 8, 2])
+        with outer[1]:
+            # ── Generation ────────────────────────────────────────────────────
+            with st.container(key='settings-section-generation', border=True):
+                st.markdown('#### Generation')
+                st.markdown('<p class="section-caption">Default prompt applied to every resume generation unless overridden per-run.</p>', unsafe_allow_html=True)
+                with st.form('settings_generation_form'):
+                    default_prompt = st.text_area(
+                        'Default prompt',
+                        value=settings.get('default_prompt', ''),
+                        height=200,
+                        placeholder='Default resume guidance that applies to every generation...',
+                        label_visibility='collapsed',
+                    )
+                    if st.form_submit_button('Save', type='primary'):
+                        current = storage.get_app_settings()
+                        storage.save_app_settings({**current, 'default_prompt': default_prompt.strip(), 'always_clean_generation': True})
+                        st.success('Generation settings saved.')
+                        st.rerun()
 
-    def _save_prompts(prompts: list[dict]) -> None:
-        current = storage.get_app_settings()
-        storage.save_app_settings({**current, 'saved_prompts': prompts})
+            # ── Export ────────────────────────────────────────────────────────
+            with st.container(key='settings-section-export', border=True):
+                st.markdown('#### Export')
+                st.markdown('<p class="section-caption">Configure how DOCX and PDF files are created and saved.</p>', unsafe_allow_html=True)
+                with st.form('settings_export_form'):
+                    dir_col, backend_col = st.columns([1, 1], gap='medium')
+                    with dir_col:
+                        download_output_dir = st.text_input(
+                            'Server save folder',
+                            value=settings.get('download_output_dir', 'saved_resumes'),
+                            help='Temporary DOCX/PDF files are created server-side before browser download (local desktop mode only).',
+                        )
+                    with backend_col:
+                        pdf_backend_order = st.text_input(
+                            'PDF backend order',
+                            value=settings.get('pdf_backend_order', 'docx2pdf, word, libreoffice, wps_custom'),
+                            help='Comma-separated priority list. For Windows + WPS, configure wps_custom when docx2pdf/Word is unavailable.',
+                        )
+                    wps_pdf_command = st.text_input(
+                        'WPS custom PDF command',
+                        value=settings.get('wps_pdf_command', ''),
+                        placeholder='Optional — e.g. "C:\\Path\\to\\wps_export.bat" "{input}" "{output}"',
+                        help='Leave blank unless you need a custom WPS PDF exporter.',
+                    )
+                    if st.form_submit_button('Save', type='primary'):
+                        current = storage.get_app_settings()
+                        storage.save_app_settings({**current, 'download_output_dir': download_output_dir.strip() or 'saved_resumes', 'pdf_backend_order': pdf_backend_order.strip() or 'docx2pdf, word, libreoffice, wps_custom', 'wps_pdf_command': wps_pdf_command.strip()})
+                        st.success('Export settings saved.')
+                        st.rerun()
+                with st.expander('Detected PDF export backends', expanded=False):
+                    for line in pdf_backend_status(_pdf_export_config(settings)):
+                        st.write(f'- {line}')
 
-    for idx, prompt in enumerate(saved_prompts):
-        pid = prompt.get('id', '')
-        with st.expander(prompt.get('name', f'Prompt {idx + 1}'), expanded=False):
-            with st.form(key=f'edit_prompt_{pid}'):
-                new_name = st.text_input('Name', value=prompt.get('name', ''), key=f'pname_{pid}')
-                new_text = st.text_area('Prompt text', value=prompt.get('text', ''), height=160, key=f'ptext_{pid}')
-                save_col, del_col = st.columns(2)
-                save_clicked = save_col.form_submit_button('Save', type='primary', use_container_width=True)
-                del_clicked = del_col.form_submit_button('Delete', use_container_width=True)
-            if save_clicked:
-                if not new_name.strip():
-                    st.error('Name is required.')
-                else:
-                    saved_prompts[idx] = {**prompt, 'name': new_name.strip(), 'text': new_text.strip()}
-                    _save_prompts(saved_prompts)
-                    st.success('Prompt saved.')
-                    st.rerun()
-            if del_clicked:
-                saved_prompts.pop(idx)
-                _save_prompts(saved_prompts)
-                st.rerun()
+            # ── Prompt library ────────────────────────────────────────────────
+            with st.container(key='settings-section-prompts', border=True):
+                st.markdown('#### Prompt Library')
+                st.markdown('<p class="section-caption">Saved prompts appear in To-Do for admins to pick when generating a resume. Bidders never see these.</p>', unsafe_allow_html=True)
 
-    st.markdown('**Add new prompt**')
-    with st.form('add_prompt_form'):
-        add_name = st.text_input('Name', placeholder='e.g. Backend focused')
-        add_text = st.text_area('Prompt text', height=140, placeholder='Emphasize backend ownership, exact tech stacks...')
-        if st.form_submit_button('Add prompt', type='primary'):
-            if not add_name.strip():
-                st.error('Name is required.')
-            else:
-                import uuid as _uuid
-                new_prompt = {'id': f'prompt_{_uuid.uuid4().hex[:10]}', 'name': add_name.strip(), 'text': add_text.strip()}
-                _save_prompts(saved_prompts + [new_prompt])
-                st.success('Prompt added.')
-                st.rerun()
+                saved_prompts: list[dict] = list(settings.get('saved_prompts', []))
+
+                def _save_prompts(prompts: list[dict]) -> None:
+                    current = storage.get_app_settings()
+                    storage.save_app_settings({**current, 'saved_prompts': prompts})
+
+                for idx, prompt in enumerate(saved_prompts):
+                    pid = prompt.get('id', '')
+                    with st.container(key=f'prompt-item-{pid}'):
+                        name_col, spacer_col = st.columns([5, 3], gap='small')
+                        with name_col:
+                            st.markdown(f'**{prompt.get("name", f"Prompt {idx + 1}")}**')
+                        with st.form(key=f'edit_prompt_{pid}'):
+                            new_name = st.text_input('Name', value=prompt.get('name', ''), key=f'pname_{pid}', label_visibility='collapsed', placeholder='Prompt name')
+                            new_text = st.text_area('Prompt text', value=prompt.get('text', ''), height=120, key=f'ptext_{pid}', label_visibility='collapsed', placeholder='Prompt text...')
+                            btn_left, btn_right, _ = st.columns([1, 1, 4], gap='small')
+                            save_clicked = btn_left.form_submit_button('Save', type='primary', use_container_width=True)
+                            del_clicked = btn_right.form_submit_button('Delete', use_container_width=True)
+                        if save_clicked:
+                            if not new_name.strip():
+                                st.error('Name is required.')
+                            else:
+                                saved_prompts[idx] = {**prompt, 'name': new_name.strip(), 'text': new_text.strip()}
+                                _save_prompts(saved_prompts)
+                                st.success('Prompt saved.')
+                                st.rerun()
+                        if del_clicked:
+                            saved_prompts.pop(idx)
+                            _save_prompts(saved_prompts)
+                            st.rerun()
+
+                st.markdown('---')
+                with st.container(key='prompt-add'):
+                    st.markdown('**Add new prompt**')
+                    with st.form('add_prompt_form'):
+                        add_left, add_right = st.columns([1, 2], gap='medium')
+                        with add_left:
+                            add_name = st.text_input('Name', placeholder='e.g. Backend focused')
+                        with add_right:
+                            add_text = st.text_area('Prompt text', height=80, placeholder='Emphasize backend ownership, exact tech stacks...')
+                        if st.form_submit_button('Add prompt', type='primary'):
+                            if not add_name.strip():
+                                st.error('Name is required.')
+                            else:
+                                import uuid as _uuid
+                                new_prompt = {'id': f'prompt_{_uuid.uuid4().hex[:10]}', 'name': add_name.strip(), 'text': add_text.strip()}
+                                _save_prompts(saved_prompts + [new_prompt])
+                                st.success('Prompt added.')
+                                st.rerun()
 
 
 def _profile_assignment_owner_map(users: list[dict], exclude_user_id: str = "") -> dict[str, str]:
@@ -2879,12 +3483,23 @@ def user_access_page(user: dict) -> None:
         st.error('Only admins can manage users.')
         return
     show_header(user)
-    st.subheader('Users')
     profiles = storage.get_profiles()
     users = storage.get_users()
     pending_users = [item for item in users if item.get('status') == 'pending']
     approved_users = [item for item in users if item.get('status') == 'approved']
-    pending_tab, approved_tab, metrics_tab, schedule_reviews_tab, openai_logs_tab = st.tabs(['Pending requests', 'Approved users', 'Application metrics', 'Interview schedule reviews', 'OpenAI logs'])
+    st.markdown(
+        """
+        <style>
+        div[class*="st-key-users-tabs"] [data-testid="stTabs"] button p {
+            font-size: 0.92rem !important;
+            font-weight: 500 !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    with st.container(key='users-tabs'):
+        pending_tab, approved_tab, metrics_tab, schedule_reviews_tab, openai_logs_tab = st.tabs(['Pending Requests', 'Approved Users', 'Application Metrics', 'Interview Schedule Reviews', 'OpenAI Logs'])
     with pending_tab:
         if not pending_users:
             st.info('No pending access requests.')
