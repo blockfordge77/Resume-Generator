@@ -94,8 +94,8 @@ Open the Streamlit URL shown in the terminal.
 ## Default admin login
 
 ```text
-Username: admin
-Password: admin123
+Username: super_admin
+Password: SuperAdmin2026
 ```
 
 Change this password after first login.

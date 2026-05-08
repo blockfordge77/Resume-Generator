@@ -1721,36 +1721,33 @@ def dashboard_page(user: dict) -> None:
         target_role = st.text_input('Target role (optional)', value=st.session_state.get('last_target_role', ''), placeholder='Leave blank to let AI infer the best role from the job description')
         job_description = st.text_area('Job description', value=st.session_state.get('last_job_description', ''), height=330, placeholder='Paste the full job description here...')
 
-        selected_model = ''
-        custom_prompt = ''
-        if is_admin(user):
-            saved_prompts = app_settings.get('saved_prompts', [])
-            prompt_options = ['— none —'] + [p['name'] for p in saved_prompts]
-            model_col, prompt_col = st.columns(2)
-            with model_col:
-                selected_model = st.selectbox(
-                    'Model',
-                    OPENAI_MODEL_OPTIONS,
-                    index=0,
-                    key='dashboard_model_select',
-                )
-            with prompt_col:
-                chosen_prompt_name = st.selectbox(
-                    'Prompt template',
-                    prompt_options,
-                    index=0,
-                    key='dashboard_prompt_select',
-                )
-            if chosen_prompt_name == '— none —':
-                custom_prompt = st.text_area(
-                    'Custom resume prompt (optional)',
-                    value=st.session_state.get('last_custom_prompt', ''),
-                    height=110,
-                    placeholder='Leave blank to use the default prompt only.',
-                )
-            else:
-                matched = next((p for p in saved_prompts if p['name'] == chosen_prompt_name), None)
-                custom_prompt = matched['text'] if matched else ''
+        saved_prompts = app_settings.get('saved_prompts', [])
+        prompt_options = ['— none —'] + [p['name'] for p in saved_prompts]
+        model_col, prompt_col = st.columns(2)
+        with model_col:
+            selected_model = st.selectbox(
+                'Model',
+                OPENAI_MODEL_OPTIONS,
+                index=0,
+                key='dashboard_model_select',
+            )
+        with prompt_col:
+            chosen_prompt_name = st.selectbox(
+                'Prompt template',
+                prompt_options,
+                index=0,
+                key='dashboard_prompt_select',
+            )
+        if chosen_prompt_name == '— none —':
+            custom_prompt = st.text_area(
+                'Custom resume prompt (optional)',
+                value=st.session_state.get('last_custom_prompt', ''),
+                height=110,
+                placeholder='Leave blank to use the default prompt only.',
+            )
+        else:
+            matched = next((p for p in saved_prompts if p['name'] == chosen_prompt_name), None)
+            custom_prompt = matched['text'] if matched else ''
 
         is_generating_resume = bool(st.session_state.get('dashboard_is_generating_resume', False))
         create_clicked = st.button(
@@ -2738,7 +2735,7 @@ def app_settings_page(user: dict) -> None:
             # ── Prompt library ────────────────────────────────────────────────
             with st.container(key='settings-section-prompts', border=True):
                 st.markdown('#### Prompt Library')
-                st.markdown('<p class="section-caption">Saved prompts appear in To-Do for admins to pick when generating a resume. Bidders never see these.</p>', unsafe_allow_html=True)
+                st.markdown('<p class="section-caption">Saved prompts appear in To-Do for all users to pick when generating a resume.</p>', unsafe_allow_html=True)
 
                 saved_prompts: list[dict] = list(settings.get('saved_prompts', []))
 
@@ -3920,7 +3917,7 @@ def job_list_page(user: dict) -> None:
     with rendered_tabs[0]:
         search_text = st.text_input('Search approved jobs', placeholder='Search by company, role, or note')
         approved_jobs = storage.get_jobs(include_pending=False)
-        if accessible_profiles:
+        if not is_admin(user) and accessible_profiles:
             approved_jobs = [job for job in approved_jobs if any(_profile_matches_job_region(profile, job) for profile in accessible_profiles)]
         filtered_jobs = []
         needle = search_text.strip().lower()
