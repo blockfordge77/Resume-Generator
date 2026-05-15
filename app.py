@@ -209,6 +209,8 @@ def init_state() -> None:
         'last_scraped_job_link': '',
         'pending_nav_page': '',
         'job_list_notice': '',
+        'add_job_form_key': 0,
+        'add_job_saved_msg': '',
         'pending_dashboard_approved_job_id': '',
         'auth_token_value': '',
         'low_ats_attempts_by_job': {},
@@ -1723,31 +1725,25 @@ def dashboard_page(user: dict) -> None:
 
         saved_prompts = app_settings.get('saved_prompts', [])
         prompt_options = ['— none —'] + [p['name'] for p in saved_prompts]
+        _default_model_idx = OPENAI_MODEL_OPTIONS.index('gpt-5.1') if 'gpt-5.1' in OPENAI_MODEL_OPTIONS else 0
+        _spear1_idx = next((i + 1 for i, p in enumerate(saved_prompts) if p['name'] == 'spear-1'), 0)
         model_col, prompt_col = st.columns(2)
         with model_col:
             selected_model = st.selectbox(
                 'Model',
                 OPENAI_MODEL_OPTIONS,
-                index=0,
+                index=_default_model_idx,
                 key='dashboard_model_select',
             )
         with prompt_col:
             chosen_prompt_name = st.selectbox(
                 'Prompt template',
                 prompt_options,
-                index=0,
+                index=_spear1_idx,
                 key='dashboard_prompt_select',
             )
-        if chosen_prompt_name == '— none —':
-            custom_prompt = st.text_area(
-                'Custom resume prompt (optional)',
-                value=st.session_state.get('last_custom_prompt', ''),
-                height=110,
-                placeholder='Leave blank to use the default prompt only.',
-            )
-        else:
-            matched = next((p for p in saved_prompts if p['name'] == chosen_prompt_name), None)
-            custom_prompt = matched['text'] if matched else ''
+        matched = next((p for p in saved_prompts if p['name'] == chosen_prompt_name), None)
+        custom_prompt = matched['text'] if matched else ''
 
         is_generating_resume = bool(st.session_state.get('dashboard_is_generating_resume', False))
         create_clicked = st.button(
@@ -1770,7 +1766,7 @@ def dashboard_page(user: dict) -> None:
                 'profile_id': profile.get('id'),
                 'job_description': job_description,
                 'target_role': target_role,
-                'custom_prompt': custom_prompt,
+                'default_prompt': custom_prompt,
                 'model': selected_model,
                 'use_ai': bool(use_ai),
                 'current_job_region': current_job_region,
@@ -1788,8 +1784,7 @@ def dashboard_page(user: dict) -> None:
                         profile=gen_profile,
                         job_description=inputs.get('job_description', ''),
                         target_role=inputs.get('target_role', ''),
-                        custom_prompt=inputs.get('custom_prompt', ''),
-                        default_prompt=default_prompt,
+                        default_prompt=inputs.get('default_prompt', '') or default_prompt,
                         use_ai=bool(inputs.get('use_ai', True)),
                         clean_generation=clean_generation,
                         model=inputs.get('model', ''),
@@ -1816,7 +1811,7 @@ def dashboard_page(user: dict) -> None:
                 st.session_state['last_job_description'] = inputs.get('job_description', '')
                 st.session_state['last_target_role'] = inputs.get('target_role', '')
                 st.session_state['last_job_region'] = inputs.get('current_job_region', '')
-                st.session_state['last_custom_prompt'] = inputs.get('custom_prompt', '')
+                st.session_state['last_custom_prompt'] = inputs.get('default_prompt', '')
                 st.session_state['last_model'] = inputs.get('model', '')
                 st.session_state['last_bold_keywords'] = ''
                 st.session_state['last_auto_bold_fit_keywords'] = False
@@ -1894,7 +1889,7 @@ def dashboard_page(user: dict) -> None:
                     message=(exports or {}).get('pdf_message', ''),
                 )
             with tab_objects['Edit & Fix']:
-                _edit_and_fix_tab(current_profile, current_template, st.session_state.get('last_job_description', ''), st.session_state.get('last_target_role', ''), st.session_state.get('last_custom_prompt', ''), default_prompt, use_ai, clean_generation, model=st.session_state.get('last_model', ''))
+                _edit_and_fix_tab(current_profile, current_template, st.session_state.get('last_job_description', ''), st.session_state.get('last_target_role', ''), default_prompt, use_ai, clean_generation, model=st.session_state.get('last_model', ''))
             with tab_objects['Exports']:
                 st.markdown('**Download behavior**')
                 pdf_message = (st.session_state.get('last_exports') or {}).get('pdf_message', '')
@@ -1911,7 +1906,7 @@ def dashboard_page(user: dict) -> None:
                 if latest_saved:
                     st.caption(f'Latest saved resume id: {latest_saved}')
             with tab_objects['ATS Notes']:
-                _dashboard_ats_notes_tab(current_profile, current_template, resume, st.session_state.get('last_job_description', ''), st.session_state.get('last_target_role', ''), st.session_state.get('last_custom_prompt', ''), default_prompt, use_ai, clean_generation, model=st.session_state.get('last_model', ''))
+                _dashboard_ats_notes_tab(current_profile, current_template, resume, st.session_state.get('last_job_description', ''), st.session_state.get('last_target_role', ''), default_prompt, use_ai, clean_generation, model=st.session_state.get('last_model', ''))
             if 'Job Application Answers' in tab_objects:
                 with tab_objects['Job Application Answers']:
                     _render_application_answers_tab(
@@ -1937,7 +1932,7 @@ def dashboard_page(user: dict) -> None:
 
 # ---------- Edit / fix ----------
 
-def _edit_and_fix_tab(profile: dict, template: dict, job_description: str, target_role: str, custom_prompt: str, default_prompt: str, use_ai: bool, clean_generation: bool, model: str = '') -> None:
+def _edit_and_fix_tab(profile: dict, template: dict, job_description: str, target_role: str, default_prompt: str, use_ai: bool, clean_generation: bool, model: str = '') -> None:
     st.caption('Edit the current draft directly, then apply manual changes or send a fix request to OpenAI using the current draft as the starting point.')
     st.markdown('#### Manual draft editor')
     st.text_input('Headline', key='editor_headline')
@@ -1991,7 +1986,7 @@ def _edit_and_fix_tab(profile: dict, template: dict, job_description: str, targe
         current_draft['bold_keywords'] = (st.session_state.get('last_resume') or {}).get('bold_keywords', [])
         current_draft['auto_bold_fit_keywords'] = bool((st.session_state.get('last_resume') or {}).get('auto_bold_fit_keywords', False))
         with st.spinner('Updating current draft with OpenAI...'):
-            result = update_resume_content(profile=profile, job_description=job_description, current_resume=current_draft, fix_prompt=fix_prompt, target_role=target_role, custom_prompt=custom_prompt, default_prompt=default_prompt, use_ai=use_ai, clean_generation=clean_generation, model=model)
+            result = update_resume_content(profile=profile, job_description=job_description, current_resume=current_draft, fix_prompt=fix_prompt, target_role=target_role, default_prompt=default_prompt, use_ai=use_ai, clean_generation=clean_generation, model=model)
             _record_openai_usage(result, 'update_resume')
             updated_resume = result['resume']
             updated_resume['bold_keywords'] = current_draft.get('bold_keywords', [])
@@ -2026,9 +2021,10 @@ def profile_settings_page(user: dict) -> None:
         return
     show_header(user)
 
-    _PROFILES_NEW_KEY = 'profiles_creating_new'
-    _PROFILES_SEL_KEY = 'profiles_selected_id'
-    _PNAV_OPEN_KEY    = 'pnav_open_admin'
+    _PROFILES_NEW_KEY    = 'profiles_creating_new'
+    _PROFILES_SEL_KEY    = 'profiles_selected_id'
+    _PNAV_OPEN_KEY       = 'pnav_open_admin'
+    _PROFILES_SAVED_KEY  = 'profiles_saved_notice'
 
     current_uid = str(user.get('id', '')).strip()
     superadmin  = _is_superadmin(user)
@@ -2402,7 +2398,7 @@ def profile_settings_page(user: dict) -> None:
                                         key=f'psel_{aid}',
                                         width='stretch',
                                     )
-                                    if chosen is not None and (chosen != sel_id or creating_new):
+                                    if not creating_new and chosen is not None and chosen != sel_id:
                                         st.session_state[_PROFILES_SEL_KEY] = chosen
                                         st.session_state[_PROFILES_NEW_KEY] = False
                                         st.rerun()
@@ -2415,6 +2411,7 @@ def profile_settings_page(user: dict) -> None:
                                         if st.button('＋  New profile', key='profiles_new_btn', width='stretch'):
                                             st.session_state[_PROFILES_NEW_KEY] = True
                                             st.session_state[_PROFILES_SEL_KEY] = None
+                                            st.session_state.pop(f'psel_{aid}', None)
                                             st.rerun()
 
             # ── Right: detail / form ────────────────────────────────────
@@ -2528,7 +2525,12 @@ def profile_settings_page(user: dict) -> None:
                     elif not is_new:
                         st.warning('No resume uploaded yet — required before generating.')
 
-                    with st.form('profile_form'):
+                    _saved_notice = st.session_state.pop(_PROFILES_SAVED_KEY, None)
+                    if _saved_notice:
+                        st.success(_saved_notice)
+
+                    _profile_form_key = f'profile_form_{selected_profile.get("id", "new")}'
+                    with st.form(_profile_form_key):
                         st.markdown('**Basic info**')
                         r1c1, r1c2, r1c3 = st.columns(3)
                         with r1c1:
@@ -2557,16 +2559,67 @@ def profile_settings_page(user: dict) -> None:
                             st.caption('Resume DOCX — read-only.')
                             uploaded_resume = None
 
-                        st.markdown('**AI helper data** *(optional)*')
-                        skills_text = st.text_area('Technical skills (comma-separated)', value=', '.join(selected_profile.get('technical_skills', [])), height=68, disabled=not can_edit)
-                        summary_seed = st.text_area('About / summary seed', value=selected_profile.get('summary_seed', ''), height=80, disabled=not can_edit)
-
                         with st.expander('Work history', expanded=False):
-                            st.caption('Structured helper data for stronger AI generation. The DOCX is the style source.')
+                            st.caption('Seed bullets used by AI to write job-aligned experience bullets.')
                             work_history_text = st.text_area('Work history', value=_serialize_work_history(selected_profile.get('work_history', [])), height=200, label_visibility='collapsed', disabled=not can_edit)
 
                         with st.expander('Education history', expanded=False):
                             education_text = st.text_area('Education history', value=_serialize_education_history(selected_profile.get('education_history', [])), height=100, label_visibility='collapsed', disabled=not can_edit)
+
+                        st.markdown('**Generation settings**')
+                        _existing_gen = selected_profile.get('generation_settings') or {}
+                        _existing_bullet_counts = _existing_gen.get('bullet_counts') or []
+                        _parsed_wh = _parse_work_history(work_history_text) if can_edit else selected_profile.get('work_history', [])
+                        _wh_count = len(_parsed_wh)
+
+                        gs_c1, gs_c2, gs_c3 = st.columns(3)
+                        with gs_c1:
+                            total_years_of_experience = st.number_input(
+                                'Total years of exp',
+                                min_value=0, max_value=50,
+                                value=int(selected_profile.get('total_years_of_experience') or 0),
+                                step=1,
+                                disabled=not can_edit,
+                                help='Stated in the professional summary as "X+ years of experience".',
+                            )
+                        with gs_c2:
+                            summary_char_count = st.number_input(
+                                'Summary char count',
+                                min_value=0, max_value=3000,
+                                value=int(_existing_gen.get('summary_char_count') or 0),
+                                step=10,
+                                disabled=not can_edit,
+                                help='Target character count for the professional summary. 0 = AI decides (800–1100 chars).',
+                            )
+                        with gs_c3:
+                            skills_count = st.number_input(
+                                'Skills count',
+                                min_value=60, max_value=100,
+                                value=int(_existing_gen.get('skills_count') or 65),
+                                step=1,
+                                disabled=not can_edit,
+                                help='Target number of technical skills (60–100).',
+                            )
+
+                        _pid_key = selected_profile.get('id', 'new')
+                        if _wh_count > 0:
+                            st.caption('Bullet count per company (most recent first):')
+                            _bullet_cols = st.columns(_wh_count)
+                            bullet_counts = []
+                            for _ci in range(_wh_count):
+                                _default_bc = int(_existing_bullet_counts[_ci]) if _ci < len(_existing_bullet_counts) else (14 if _ci == 0 else 10 if _ci < 3 else 8)
+                                with _bullet_cols[_ci]:
+                                    _bc = st.number_input(
+                                        f'Co.{_ci + 1}',
+                                        min_value=1, max_value=20,
+                                        value=_default_bc,
+                                        step=1,
+                                        key=f'profile_bullet_count_{_pid_key}_{_ci}',
+                                        disabled=not can_edit,
+                                    )
+                                    bullet_counts.append(_bc)
+                        else:
+                            bullet_counts = list(_existing_bullet_counts)
 
                         if can_edit:
                             save_col, del_col = st.columns([3, 1])
@@ -2607,11 +2660,15 @@ def profile_settings_page(user: dict) -> None:
                             'linkedin': linkedin.strip(),
                             'portfolio': portfolio.strip(),
                             'default_template_id': '',
-                            'summary_seed': summary_seed.strip(),
-                            'technical_skills': [s.strip() for s in skills_text.split(',') if s.strip()],
+                            'total_years_of_experience': int(total_years_of_experience) if total_years_of_experience else 0,
                             'work_history': _parse_work_history(work_history_text),
                             'education_history': _parse_education_history(education_text),
                             'uploaded_resume': uploaded_resume_record,
+                            'generation_settings': {
+                                'summary_char_count': int(summary_char_count) if summary_char_count else 0,
+                                'skills_count': int(skills_count),
+                                'bullet_counts': bullet_counts,
+                            },
                         }
                         if not selected_profile.get('id'):
                             payload['created_by_user_id'] = current_uid
@@ -2619,7 +2676,7 @@ def profile_settings_page(user: dict) -> None:
                         storage.upsert_profile(payload)
                         st.session_state[_PROFILES_NEW_KEY] = False
                         st.session_state[_PROFILES_SEL_KEY] = profile_id
-                        st.success('Profile saved.')
+                        st.session_state[_PROFILES_SAVED_KEY] = 'Profile saved successfully.'
                         st.rerun()
 
                     if delete_clicked and selected_profile.get('id'):
@@ -2737,6 +2794,10 @@ def app_settings_page(user: dict) -> None:
                 st.markdown('#### Prompt Library')
                 st.markdown('<p class="section-caption">Saved prompts appear in To-Do for all users to pick when generating a resume.</p>', unsafe_allow_html=True)
 
+                _prompt_notice = st.session_state.pop('prompt_library_notice', '')
+                if _prompt_notice:
+                    st.success(_prompt_notice)
+
                 saved_prompts: list[dict] = list(settings.get('saved_prompts', []))
 
                 def _save_prompts(prompts: list[dict]) -> None:
@@ -2761,11 +2822,13 @@ def app_settings_page(user: dict) -> None:
                             else:
                                 saved_prompts[idx] = {**prompt, 'name': new_name.strip(), 'text': new_text.strip()}
                                 _save_prompts(saved_prompts)
-                                st.success('Prompt saved.')
+                                st.session_state['prompt_library_notice'] = f'Prompt "{new_name.strip()}" saved successfully.'
                                 st.rerun()
                         if del_clicked:
+                            deleted_name = prompt.get('name', 'Prompt')
                             saved_prompts.pop(idx)
                             _save_prompts(saved_prompts)
+                            st.session_state['prompt_library_notice'] = f'Prompt "{deleted_name}" deleted.'
                             st.rerun()
 
                 st.markdown('---')
@@ -2784,7 +2847,7 @@ def app_settings_page(user: dict) -> None:
                                 import uuid as _uuid
                                 new_prompt = {'id': f'prompt_{_uuid.uuid4().hex[:10]}', 'name': add_name.strip(), 'text': add_text.strip()}
                                 _save_prompts(saved_prompts + [new_prompt])
-                                st.success('Prompt added.')
+                                st.session_state['prompt_library_notice'] = f'Prompt "{add_name.strip()}" added successfully.'
                                 st.rerun()
 
 
@@ -3915,25 +3978,42 @@ def job_list_page(user: dict) -> None:
     rendered_tabs = st.tabs(tabs)
 
     with rendered_tabs[0]:
-        search_text = st.text_input('Search approved jobs', placeholder='Search by company, role, or note')
+        search_col, sort_col = st.columns([4, 1])
+        with search_col:
+            search_text = st.text_input('Search approved jobs', placeholder='Search by company, role, or note')
+        with sort_col:
+            sort_order = st.selectbox('Sort', ['Newest first', 'Oldest first'], index=0, key='approved_jobs_sort', label_visibility='hidden')
         approved_jobs = storage.get_jobs(include_pending=False)
         if not is_admin(user) and accessible_profiles:
             approved_jobs = [job for job in approved_jobs if any(_profile_matches_job_region(profile, job) for profile in accessible_profiles)]
-        filtered_jobs = []
         needle = search_text.strip().lower()
+        filtered_jobs = []
         for job in approved_jobs:
             blob = ' '.join([job.get('company', ''), job.get('job_title', ''), job.get('description', ''), job.get('note', ''), job.get('region', '')]).lower()
             if not needle or needle in blob:
                 filtered_jobs.append(job)
+
+        def _job_sort_key(j: dict) -> str:
+            return str(j.get('submitted_at', '') or j.get('approved_at', '') or '')
+
+        filtered_jobs.sort(key=_job_sort_key, reverse=(sort_order == 'Newest first'))
+
         if not filtered_jobs:
             st.info('No approved jobs match your assigned profile markets yet.')
         page_jobs, _ = _paginate_items(
             filtered_jobs,
             page_key='job_list_approved',
             per_page=20,
-            filter_signature=needle,
+            filter_signature=f'{needle}|{sort_order}',
         )
+        current_day: str | None = None
         for job in page_jobs:
+            job_dt = _safe_parse_datetime(_job_sort_key(job))
+            job_day = job_dt.date().isoformat() if job_dt else 'unknown'
+            if job_day != current_day:
+                current_day = job_day
+                day_label = job_dt.strftime('%B %d, %Y') if job_dt else 'Unknown date'
+                st.markdown(f'#### {day_label}')
             with st.container(border=True):
                 info_col, action_col = st.columns([5.4, 1.2], gap='medium')
                 with info_col:
@@ -4021,7 +4101,11 @@ def job_list_page(user: dict) -> None:
                         st.rerun()
 
     with rendered_tabs[1]:
-        with st.form('add_job_form'):
+        saved_msg = st.session_state.pop('add_job_saved_msg', '')
+        if saved_msg:
+            st.success(saved_msg)
+        form_key = f'add_job_form_{st.session_state["add_job_form_key"]}'
+        with st.form(form_key):
             company = st.text_input('Company')
             job_title = st.text_input('Job title / role')
             c_add1, c_add2 = st.columns(2)
@@ -4065,7 +4149,8 @@ def job_list_page(user: dict) -> None:
                 'approved_by_username': user.get('username', '') if status == 'approved' else '',
             }
             storage.upsert_job(job_payload)
-            st.session_state['job_list_notice'] = 'Job saved.' if status == 'approved' else 'Job submitted for admin approval.'
+            st.session_state['add_job_form_key'] += 1
+            st.session_state['add_job_saved_msg'] = 'Job saved successfully.' if status == 'approved' else 'Job submitted for admin approval.'
             st.rerun()
 
     if is_admin(user):
@@ -4661,7 +4746,7 @@ def _ats_notes_context_block(resume: dict) -> None:
             st.write(f"- {group.get('category', 'Other')}: {items}")
 
 
-def _dashboard_ats_notes_tab(profile: dict, template: dict, resume: dict, job_description: str, target_role: str, custom_prompt: str, default_prompt: str, use_ai: bool, clean_generation: bool, model: str = '') -> None:
+def _dashboard_ats_notes_tab(profile: dict, template: dict, resume: dict, job_description: str, target_role: str, default_prompt: str, use_ai: bool, clean_generation: bool, model: str = '') -> None:
     if not str(job_description).strip():
         st.info('Add a job description to see ATS analysis.')
         return
@@ -4684,7 +4769,7 @@ def _dashboard_ats_notes_tab(profile: dict, template: dict, resume: dict, job_de
             st.error('Generate a resume first.')
             return
         with st.spinner('Improving the current draft against ATS guidance...'):
-            result = improve_resume_to_target_ats(profile=profile, job_description=job_description, current_resume=current_resume, target_score=int(target_score), max_rounds=int(max_rounds), additional_requirements=st.session_state.get('dashboard_ats_improve_prompt', ''), target_role=target_role, custom_prompt=custom_prompt, default_prompt=default_prompt, use_ai=use_ai, clean_generation=clean_generation, model=model)
+            result = improve_resume_to_target_ats(profile=profile, job_description=job_description, current_resume=current_resume, target_score=int(target_score), max_rounds=int(max_rounds), additional_requirements=st.session_state.get('dashboard_ats_improve_prompt', ''), target_role=target_role, default_prompt=default_prompt, use_ai=use_ai, clean_generation=clean_generation, model=model)
             _record_openai_usage_for_improve(result)
         updated_resume = result.get('resume', current_resume)
         exports = _build_uploaded_docx_pdf_exports(resume=updated_resume, profile=profile, app_settings=storage.get_app_settings())
@@ -4839,15 +4924,11 @@ def render_top_nav(user: dict) -> str:
 
     current_page = st.session_state.get('top_navigation', options[0])
 
-    generated_total = len(storage.get_generated_resumes())
-    if not is_admin(user):
-        generated_total = len([item for item in storage.get_generated_resumes() if item.get('created_by_user_id') == user.get('id')])
-
     def _label(page: str) -> str:
         if page == 'To-Do' and current_score is not None:
             return f'{page} ({current_score})'
         if page == 'Resumes':
-            return f'{page} ({generated_total})'
+            return page
         return page
 
     st.markdown(

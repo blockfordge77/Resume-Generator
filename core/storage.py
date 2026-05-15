@@ -207,6 +207,22 @@ def _normalize_uploaded_resume(item: Any) -> dict:
     }
 
 
+def _normalize_generation_settings(raw) -> dict:
+    if not isinstance(raw, dict):
+        return {'summary_char_count': 0, 'skills_count': 65, 'bullet_counts': []}
+    bullet_counts = []
+    for bc in raw.get('bullet_counts') or []:
+        try:
+            bullet_counts.append(int(bc))
+        except Exception:
+            pass
+    return {
+        'summary_char_count': int(raw.get('summary_char_count') or 0),
+        'skills_count': int(raw.get('skills_count') or 65),
+        'bullet_counts': bullet_counts,
+    }
+
+
 def _normalize_profile(item: dict) -> dict:
     work_history = []
     for raw_job in item.get('work_history', []) or []:
@@ -233,6 +249,7 @@ def _normalize_profile(item: dict) -> dict:
         'active': bool(item.get('active', True)),
         'created_by_user_id': str(item.get('created_by_user_id', '')).strip(),
         'created_by_username': str(item.get('created_by_username', '')).strip(),
+        'total_years_of_experience': int(item['total_years_of_experience']) if str(item.get('total_years_of_experience') or '').strip().isdigit() else 0,
         'work_history': work_history,
         'education_history': [
             {
@@ -243,6 +260,7 @@ def _normalize_profile(item: dict) -> dict:
             }
             for edu in item.get('education_history', []) or []
         ],
+        'generation_settings': _normalize_generation_settings(item.get('generation_settings')),
     }
 
 

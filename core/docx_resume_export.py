@@ -19,6 +19,8 @@ from docx.oxml.ns import qn
 from docx.table import Table
 from docx.text.paragraph import Paragraph
 
+from core.resume_engine import KNOWN_TECH_TERMS
+
 
 SECTION_ALIASES = {
     "summary": {
@@ -297,6 +299,7 @@ def _expanded_keywords_with_phrases(keywords: list[str]) -> list[str]:
 def _technical_skill_keywords(resume: dict) -> list[str]:
     ordered: list[str] = []
     seen: set[str] = set()
+    # Resume-specific skills first (highest priority / preserves casing)
     for item in resume.get("technical_skills", []) or []:
         clean = _plain_resume_text(item)
         if len(clean) < 2:
@@ -305,6 +308,12 @@ def _technical_skill_keywords(resume: dict) -> list[str]:
         if key not in seen:
             seen.add(key)
             ordered.append(clean)
+    # Add all known tech terms so bullets/summary always get fully bolded
+    for term in KNOWN_TECH_TERMS:
+        key = term.lower()
+        if key not in seen:
+            seen.add(key)
+            ordered.append(term)
     return _expanded_keywords_with_phrases(ordered)
 
 
@@ -742,6 +751,95 @@ def _skill_lines(resume: dict) -> list[str]:
     return [", ".join(skills)] if skills else []
 
 
+def _skill_groups_for_rendering(resume: dict) -> list[dict]:
+    """Return parsed skill groups, or a single group from flat technical_skills."""
+    groups = _parse_skill_groups(resume.get("skill_groups") or [])
+    result = []
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        category = _plain_resume_text(group.get("category", ""))
+        items = [_plain_resume_text(item) for item in group.get("items", []) if _plain_resume_text(item)]
+        if category and items:
+            result.append({"category": category, "items": items})
+    if result:
+        return result
+    skills = [_plain_resume_text(item) for item in resume.get("technical_skills", []) if _plain_resume_text(item)]
+    if skills:
+        return [{"category": "", "items": skills}]
+    return []
+
+
+def _write_skill_groups_bold_categories(
+    anchor_paragraph: Paragraph,
+    groups: list[dict],
+    source_run=None,
+) -> Paragraph:
+    """Write skill groups so that category names are bold and skill items are normal weight.
+
+    Returns the last paragraph written so callers can continue inserting after it.
+    Each group gets its own paragraph: [BOLD category][normal ": item1, item2, ..."]
+    """
+    if not groups:
+        return anchor_paragraph
+
+    source_run = source_run or _first_meaningful_run_or_none(anchor_paragraph)
+
+    def _write_group_to_paragraph(paragraph: Paragraph, group: dict) -> None:
+        _clear_paragraph_keep_ppr(paragraph)
+        category = group["category"]
+        items_text = ", ".join(group["items"])
+        if category:
+            bold_run = paragraph.add_run(category)
+            if source_run is not None:
+                _copy_run_format(bold_run, source_run)
+            _force_run_bold(bold_run)
+            sep_run = paragraph.add_run(f"   {items_text}")
+            if source_run is not None:
+                _copy_run_format(sep_run, source_run)
+            _force_run_not_bold(sep_run)
+        else:
+            plain_run = paragraph.add_run(items_text)
+            if source_run is not None:
+                _copy_run_format(plain_run, source_run)
+            _force_run_not_bold(plain_run)
+
+    _write_group_to_paragraph(anchor_paragraph, groups[0])
+    cursor = anchor_paragraph
+    for group in groups[1:]:
+        new_p = OxmlElement("w:p")
+        if anchor_paragraph._p.pPr is not None:
+            new_p.append(deepcopy(anchor_paragraph._p.pPr))
+        cursor._p.addnext(new_p)
+        new_paragraph = Paragraph(new_p, anchor_paragraph._parent)
+        _write_group_to_paragraph(new_paragraph, group)
+        cursor = new_paragraph
+    return cursor
+
+
+def _copy_run_format(target_run, source_run) -> None:
+    """Copy font name and size from source_run to target_run without changing bold state."""
+    try:
+        if source_run.font.name:
+            target_run.font.name = source_run.font.name
+        if source_run.font.size:
+            target_run.font.size = source_run.font.size
+    except Exception:
+        pass
+
+
+def _insert_page_break_after(paragraph: Paragraph) -> Paragraph:
+    """Insert a Word page break paragraph immediately after the given paragraph."""
+    new_p = OxmlElement("w:p")
+    new_r = OxmlElement("w:r")
+    new_br = OxmlElement("w:br")
+    new_br.set(qn("w:type"), "page")
+    new_r.append(new_br)
+    new_p.append(new_r)
+    paragraph._p.addnext(new_p)
+    return Paragraph(new_p, paragraph._parent)
+
+
 def _paragraph_has_tab(paragraph: Paragraph) -> bool:
     return "\t" in (paragraph.text or "")
 
@@ -859,23 +957,122 @@ def _replace_experience_bullets_and_titles(doc: Document, resume: dict) -> bool:
 
         active_group = group[:len(bullets)]
         for paragraph, bullet in zip(active_group, bullets[:len(active_group)]):
-            _set_paragraph_text(paragraph, bullet, keywords=keywords, force_no_bold=True)
+            _set_paragraph_text(paragraph, bullet, keywords=keywords)
             changed = True
 
         cursor = active_group[-1] if active_group else first
         for bullet in bullets[len(active_group):]:
-            cursor = _insert_paragraph_after(cursor, bullet, like_paragraph=first, keywords=keywords, force_no_bold=True)
+            cursor = _insert_paragraph_after(cursor, bullet, like_paragraph=first, keywords=keywords)
             changed = True
 
     return changed
+
+
+def _replace_skills_with_bold_categories(doc: Document, resume: dict) -> bool:
+    """Replace the skills section, rendering category names bold and skill items normal.
+
+    Returns True if the section was found and updated.
+    """
+    skill_groups = _skill_groups_for_rendering(resume)
+    if not skill_groups:
+        return False
+
+    paragraphs = _all_body_paragraphs(doc)
+    # Try placeholder paragraphs first
+    lowered_placeholders = {item.lower() for item in SKILL_PLACEHOLDERS}
+    for paragraph in _all_story_paragraphs(doc):
+        if _clean_text(paragraph.text).lower() in lowered_placeholders:
+            _write_skill_groups_bold_categories(paragraph, skill_groups)
+            return True
+
+    # Fall back to locating the skills section
+    section_range = _find_section_range(paragraphs, "skills")
+    if not section_range:
+        return False
+    start, end = section_range
+    body = paragraphs[start + 1:end]
+    content_body = [p for p in body if _clean_text(p.text) and not _is_decorative_or_blank_paragraph(p)]
+    if content_body:
+        anchor = content_body[0]
+        for p in content_body[1:]:
+            _delete_paragraph(p)
+        _write_skill_groups_bold_categories(anchor, skill_groups)
+    else:
+        anchor = paragraphs[start]
+        source_run = _first_meaningful_run_or_none(anchor)
+        cursor = anchor
+        for group in skill_groups:
+            new_p = OxmlElement("w:p")
+            if anchor._p.pPr is not None:
+                new_p.append(deepcopy(anchor._p.pPr))
+            cursor._p.addnext(new_p)
+            new_para = Paragraph(new_p, anchor._parent)
+            _write_skill_groups_bold_categories(new_para, [group], source_run)
+            cursor = new_para
+    return True
+
+
+def _strip_paragraph_borders(doc: Document) -> None:
+    """Remove any w:pBdr from every paragraph (template cleanup before content is written)."""
+    for paragraph in doc.paragraphs:
+        pPr = paragraph._p.find(qn("w:pPr"))
+        if pPr is None:
+            continue
+        pBdr = pPr.find(qn("w:pBdr"))
+        if pBdr is not None:
+            pPr.remove(pBdr)
+
+
+def _inject_section_heading_borders(doc: Document) -> None:
+    """Add a blue bottom border to section headings only (called after all content is written).
+
+    Section headings (PROFESSIONAL SUMMARY, PROFESSIONAL EXPERIENCE, EDUCATION,
+    TECHNICAL SKILLS) are identified by having at least one run with w:color=00B0F0.
+    The Full Name paragraph (Heading 3, no blue color) is intentionally skipped.
+    No page-break attributes are added.
+    """
+    for paragraph in doc.paragraphs:
+        p = paragraph._p
+
+        # detect blue-colored run
+        has_blue_run = False
+        for rPr in p.iter(qn("w:rPr")):
+            color_el = rPr.find(qn("w:color"))
+            if color_el is not None:
+                val = (color_el.get(qn("w:val")) or "").upper()
+                if val == "00B0F0":
+                    has_blue_run = True
+                    break
+
+        if not has_blue_run:
+            continue
+
+        pPr = p.find(qn("w:pPr"))
+        if pPr is None:
+            pPr = OxmlElement("w:pPr")
+            p.insert(0, pPr)
+
+        # remove any existing border first (safety)
+        existing = pPr.find(qn("w:pBdr"))
+        if existing is not None:
+            pPr.remove(existing)
+
+        new_pBdr = OxmlElement("w:pBdr")
+        bottom = OxmlElement("w:bottom")
+        bottom.set(qn("w:val"), "single")
+        bottom.set(qn("w:sz"), "6")
+        bottom.set(qn("w:space"), "1")
+        bottom.set(qn("w:color"), "00B0F0")
+        new_pBdr.append(bottom)
+        pPr.append(new_pBdr)
 
 
 def apply_resume_to_docx(docx_path: Path, resume: dict) -> None:
     doc = Document(str(docx_path))
     headline = _plain_resume_text(resume.get("headline", ""))
     summary = _plain_resume_text(resume.get("summary", ""))
-    skills = _skill_lines(resume)
     tech_keywords = _technical_skill_keywords(resume)
+    _strip_paragraph_borders(doc)
 
     if headline:
         _replace_inline_placeholders(
@@ -890,18 +1087,16 @@ def apply_resume_to_docx(docx_path: Path, resume: dict) -> None:
     _replace_role_placeholders(doc, resume)
 
     if summary:
-        if not _replace_placeholders(doc, SUMMARY_PLACEHOLDERS, [summary], keywords=tech_keywords, force_no_bold=True):
-            _replace_section_body(doc, "summary", [summary], keywords=tech_keywords, force_no_bold=True)
+        if not _replace_placeholders(doc, SUMMARY_PLACEHOLDERS, [summary], keywords=tech_keywords):
+            _replace_section_body(doc, "summary", [summary], keywords=tech_keywords)
 
-    if skills:
-        # Skills section must always be normal/no-bold, even when terms are in
-        # technical_skills or the uploaded sample skills paragraph is bold.
-        if not _replace_placeholders(doc, SKILL_PLACEHOLDERS, skills, force_no_bold=True):
+    # Skills: category names bold, individual skills normal weight
+    if not _replace_skills_with_bold_categories(doc, resume):
+        skills = _skill_lines(resume)
+        if skills:
             _replace_section_body(doc, "skills", skills, force_no_bold=True)
 
-    # Experience placeholders replace an entire placeholder block. Normal
-    # experience sections update only bullet paragraphs to protect company,
-    # role, location, and duration style.
+    # Experience: replace bullets, then insert page breaks after companies 1 and 3
     experience_lines = []
     for job_index, job in enumerate(resume.get("work_history", []) or []):
         if job_index:
@@ -926,10 +1121,71 @@ def apply_resume_to_docx(docx_path: Path, resume: dict) -> None:
                 experience_lines.append(f"• {bullet_text}")
 
     if experience_lines:
-        if not _replace_placeholders(doc, EXPERIENCE_PLACEHOLDERS, experience_lines, keywords=tech_keywords, force_no_bold=True):
+        if not _replace_placeholders(doc, EXPERIENCE_PLACEHOLDERS, experience_lines, keywords=tech_keywords):
             _replace_experience_bullets_and_titles(doc, resume)
 
+    # Add blue bottom border to section headings (after all content is in place)
+    _inject_section_heading_borders(doc)
+
     doc.save(str(docx_path))
+
+
+def _insert_experience_page_breaks(doc: Document, resume: dict) -> None:
+    """Insert a page break after company 1's last bullet and after company 3's last bullet.
+
+    This forces:  page 1 = header+summary+company1,  page 2 = company2+company3,  page 3 = company4+education+skills
+    Only fires when there are at least 2 companies; only inserts break after company 3 when there are at least 4.
+    """
+    jobs = resume.get("work_history", []) or []
+    if len(jobs) < 2:
+        return
+
+    paragraphs = _all_body_paragraphs(doc)
+
+    # Find bullet groups inside the experience section
+    exp_range = _find_section_range(paragraphs, "experience")
+    if not exp_range:
+        return
+    exp_start, exp_end = exp_range
+    exp_body = paragraphs[exp_start + 1:exp_end]
+
+    bullet_group_last: list[Paragraph] = []
+    current_group: list[Paragraph] = []
+    for paragraph in exp_body:
+        if _paragraph_looks_like_bullet_content(paragraph):
+            current_group.append(paragraph)
+        else:
+            if current_group:
+                bullet_group_last.append(current_group[-1])
+                current_group = []
+    if current_group:
+        bullet_group_last.append(current_group[-1])
+
+    # Insert page break after company 1 (index 0)
+    if len(bullet_group_last) >= 1:
+        _insert_page_break_after(bullet_group_last[0])
+
+    # Insert page break after company 3 (index 2) — only when 4+ companies exist
+    if len(jobs) >= 4 and len(bullet_group_last) >= 3:
+        # Re-query paragraphs after the first insertion shifted offsets
+        paragraphs2 = _all_body_paragraphs(doc)
+        exp_range2 = _find_section_range(paragraphs2, "experience")
+        if exp_range2:
+            exp_start2, exp_end2 = exp_range2
+            exp_body2 = paragraphs2[exp_start2 + 1:exp_end2]
+            bullet_group_last2: list[Paragraph] = []
+            current_group2: list[Paragraph] = []
+            for paragraph in exp_body2:
+                if _paragraph_looks_like_bullet_content(paragraph):
+                    current_group2.append(paragraph)
+                else:
+                    if current_group2:
+                        bullet_group_last2.append(current_group2[-1])
+                        current_group2 = []
+            if current_group2:
+                bullet_group_last2.append(current_group2[-1])
+            if len(bullet_group_last2) >= 3:
+                _insert_page_break_after(bullet_group_last2[2])
 
 
 def find_soffice() -> str | None:
