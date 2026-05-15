@@ -266,17 +266,18 @@ def _build_api_trace(*, flow_id: str, call_kind: str, model: str, schema_name: s
     return trace
 
 
-def _openai_json_schema_call(*, client, model: str, developer_message: str, payload: dict, schema_name: str, schema: dict, flow_id: str, call_kind: str, attempt: int | None = None) -> tuple[dict, dict]:
+def _openai_json_schema_call(*, client, model: str, developer_message: str, payload: dict, schema_name: str, schema: dict, flow_id: str, call_kind: str, attempt: int | None = None, user_id: str = '') -> tuple[dict, dict]:
     input_messages = [
         {'role': 'developer', 'content': developer_message},
         {'role': 'user', 'content': json.dumps(payload, ensure_ascii=False)},
     ]
     started = time.perf_counter()
     try:
-        response = client.responses.create(
+        call_kwargs: dict = dict(
             model=model,
             input=input_messages,
             max_output_tokens=8000,
+            store=False,
             text={
                 'format': {
                     'type': 'json_schema',
@@ -286,6 +287,9 @@ def _openai_json_schema_call(*, client, model: str, developer_message: str, payl
                 }
             },
         )
+        if user_id:
+            call_kwargs['user'] = user_id
+        response = client.responses.create(**call_kwargs)
         duration_ms = int((time.perf_counter() - started) * 1000)
         parsed = json.loads(str(getattr(response, 'output_text', '') or ''))
         trace = _build_api_trace(
@@ -321,49 +325,80 @@ def _openai_json_schema_call(*, client, model: str, developer_message: str, payl
 
 
 CATEGORY_ALIASES = {
+    'Languages': [
+        'Python', 'JavaScript', 'TypeScript', 'Java', 'Go', 'Rust', 'C#', 'C++', 'C', 'Ruby', 'PHP', 'Swift', 'Kotlin',
+        'Scala', 'R', 'Bash', 'Shell', 'SQL', 'HTML', 'CSS', 'Solidity', 'Elixir', 'Dart', 'Lua',
+    ],
     'Frontend': [
         'React', 'Next.js', 'Redux', 'React Query', 'Tailwind CSS', 'Material UI', 'Bootstrap', 'Storybook', 'Webpack', 'Vite',
-        'Angular', 'Vue', 'Nuxt', 'Svelte', 'jQuery'
+        'Angular', 'Vue', 'Nuxt', 'Svelte', 'jQuery',
     ],
     'Backend': [
         'Node.js', 'Express', 'NestJS', 'FastAPI', 'Flask', 'Django', 'Spring Boot', 'ASP.NET Core', '.NET', 'Ruby on Rails',
         'Laravel', 'Phoenix', 'gRPC', 'GraphQL', 'Apollo GraphQL', 'Hibernate', 'Entity Framework', 'Prisma', 'SQLAlchemy',
-        'RabbitMQ', 'Celery'
+        'RabbitMQ', 'Celery', 'REST API', 'WebSockets', 'Microservices', 'API Gateway',
     ],
     'Data': [
         'PostgreSQL', 'MySQL', 'SQL Server', 'SQLite', 'MongoDB', 'Redis', 'Elasticsearch', 'OpenSearch', 'Kafka', 'Snowflake',
-        'dbt', 'Airflow', 'Spark', 'BigQuery', 'DynamoDB'
+        'dbt', 'Airflow', 'Spark', 'BigQuery', 'DynamoDB', 'Cassandra', 'ClickHouse', 'Redshift', 'Databricks',
     ],
     'Cloud / DevOps': [
         'AWS', 'Azure', 'GCP', 'Docker', 'Kubernetes', 'Helm', 'Terraform', 'GitHub Actions', 'GitLab CI', 'Jenkins', 'Argo CD',
         'Prometheus', 'Grafana', 'Datadog', 'Sentry', 'Nginx', 'Linux', 'Azure DevOps', 'Cloud Run', 'GKE', 'EKS', 'ECS', 'EC2',
-        'S3', 'RDS', 'Lambda', 'CloudFront', 'IAM', 'Key Vault', 'Azure Functions'
+        'S3', 'RDS', 'Lambda', 'CloudFront', 'IAM', 'Key Vault', 'Azure Functions', 'Ansible', 'Pulumi',
+        'CI/CD', 'Infrastructure as Code', 'Load Balancing', 'Auto Scaling', 'Service Mesh', 'Istio',
     ],
     'Testing': [
-        'Jest', 'Playwright', 'Cypress', 'React Testing Library', 'Pytest', 'JUnit', 'NUnit', 'Selenium', 'Postman'
+        'Jest', 'Playwright', 'Cypress', 'React Testing Library', 'Pytest', 'JUnit', 'NUnit', 'Selenium', 'Postman',
+        'Unit Testing', 'Integration Testing', 'End-to-End Testing', 'TDD', 'BDD', 'Mockito',
     ],
     'AI / Automation': [
-        'OpenAI API', 'LangChain', 'LlamaIndex', 'Pinecone', 'Weaviate', 'PyTorch', 'TensorFlow', 'Hugging Face'
+        'OpenAI API', 'LangChain', 'LlamaIndex', 'Pinecone', 'Weaviate', 'PyTorch', 'TensorFlow', 'Hugging Face',
+        'scikit-learn', 'Pandas', 'NumPy', 'MLflow', 'RAG', 'Vector Database', 'LLM',
+    ],
+    'Professional Skills': [
+        'Team Leadership', 'Technical Leadership', 'Agile', 'Scrum', 'Kanban', 'Code Review',
+        'System Design', 'Architecture Design', 'Mentoring', 'Cross-functional Collaboration',
+        'Technical Documentation', 'Problem Solving', 'Communication', 'Project Management',
     ],
     'Other Relevant': [
-        'Stripe', 'Twilio', 'Socket.IO', 'Auth0', 'Okta', 'Splunk', 'New Relic', 'MCP', 'FastMCP'
+        'Stripe', 'Twilio', 'Socket.IO', 'Auth0', 'Okta', 'Splunk', 'New Relic', 'MCP', 'FastMCP',
+        'Git', 'GitHub', 'GitLab', 'Jira', 'Confluence', 'Figma', 'Swagger', 'OpenAPI',
     ],
 }
 
 KNOWN_TECH_TERMS = [
+    # Languages
+    'Python', 'JavaScript', 'TypeScript', 'Java', 'Go', 'Rust', 'C#', 'C++', 'C', 'Ruby', 'PHP', 'Swift', 'Kotlin',
+    'Scala', 'R', 'Bash', 'Shell', 'SQL', 'HTML', 'CSS', 'Solidity', 'Elixir', 'Clojure', 'Haskell', 'Dart', 'Lua',
+    # Frontend
     'React', 'Next.js', 'Redux', 'React Query', 'Tailwind CSS', 'Material UI', 'Bootstrap', 'Storybook', 'Webpack', 'Vite',
     'Angular', 'Vue', 'Nuxt', 'Svelte', 'jQuery',
+    # Backend
     'Node.js', 'Express', 'NestJS', 'FastAPI', 'Flask', 'Django', 'Spring Boot', 'ASP.NET Core', '.NET', 'Ruby on Rails',
     'Laravel', 'Phoenix', 'gRPC', 'GraphQL', 'Apollo GraphQL', 'Hibernate', 'Entity Framework', 'Prisma', 'SQLAlchemy',
-    'RabbitMQ', 'Celery',
+    'RabbitMQ', 'Celery', 'REST API', 'WebSockets', 'Microservices', 'API Gateway',
+    # Data / Databases
     'PostgreSQL', 'MySQL', 'SQL Server', 'SQLite', 'MongoDB', 'Redis', 'Elasticsearch', 'OpenSearch', 'Kafka', 'Snowflake',
-    'dbt', 'Airflow', 'Spark', 'BigQuery', 'DynamoDB',
+    'dbt', 'Airflow', 'Spark', 'BigQuery', 'DynamoDB', 'Cassandra', 'ClickHouse', 'Redshift', 'Databricks',
+    # Cloud / DevOps
     'AWS', 'Azure', 'GCP', 'Docker', 'Kubernetes', 'Helm', 'Terraform', 'GitHub Actions', 'GitLab CI', 'Jenkins', 'Argo CD',
     'Prometheus', 'Grafana', 'Datadog', 'Sentry', 'Nginx', 'Linux', 'Azure DevOps', 'Cloud Run', 'GKE', 'EKS', 'ECS', 'EC2',
-    'S3', 'RDS', 'Lambda', 'CloudFront', 'IAM', 'Key Vault', 'Azure Functions',
+    'S3', 'RDS', 'Lambda', 'CloudFront', 'IAM', 'Key Vault', 'Azure Functions', 'Ansible', 'Pulumi', 'Vagrant',
+    'CI/CD', 'Infrastructure as Code', 'Load Balancing', 'Auto Scaling', 'Service Mesh', 'Istio',
+    # Testing
     'Jest', 'Playwright', 'Cypress', 'React Testing Library', 'Pytest', 'JUnit', 'NUnit', 'Selenium', 'Postman',
+    'Unit Testing', 'Integration Testing', 'End-to-End Testing', 'TDD', 'BDD', 'Mockito',
+    # AI / ML
     'OpenAI API', 'LangChain', 'LlamaIndex', 'Pinecone', 'Weaviate', 'PyTorch', 'TensorFlow', 'Hugging Face',
-    'Stripe', 'Twilio', 'Socket.IO', 'Auth0', 'Okta', 'Splunk', 'New Relic', 'MCP', 'FastMCP'
+    'scikit-learn', 'Pandas', 'NumPy', 'Jupyter', 'MLflow', 'RAG', 'Vector Database', 'LLM',
+    # Other tools
+    'Stripe', 'Twilio', 'Socket.IO', 'Auth0', 'Okta', 'Splunk', 'New Relic', 'MCP', 'FastMCP',
+    'Git', 'GitHub', 'GitLab', 'Jira', 'Confluence', 'Figma', 'Swagger', 'OpenAPI',
+    # Professional / soft skills
+    'Team Leadership', 'Technical Leadership', 'Agile', 'Scrum', 'Kanban', 'Code Review',
+    'System Design', 'Architecture Design', 'Mentoring', 'Cross-functional Collaboration',
+    'Technical Documentation', 'Problem Solving', 'Communication', 'Project Management',
 ]
 
 TECH_ALIAS_MAP = {
@@ -478,7 +513,6 @@ RESUME_SCHEMA = {
     'properties': {
         'headline': {'type': 'string'},
         'summary': {'type': 'string'},
-        'summary_char_count': {'type': 'integer'},
         'skill_groups': {
             'type': 'array',
             'items': {
@@ -499,14 +533,13 @@ RESUME_SCHEMA = {
                 'properties': {
                     'company_index': {'type': 'integer'},
                     'role_title': {'type': 'string'},
-                    'bullet_count': {'type': 'integer'},
                     'bullets': {'type': 'array', 'items': {'type': 'string'}},
                 },
-                'required': ['company_index', 'role_title', 'bullet_count', 'bullets'],
+                'required': ['company_index', 'role_title', 'bullets'],
             },
         },
     },
-    'required': ['headline', 'summary', 'summary_char_count', 'skill_groups', 'work_history'],
+    'required': ['headline', 'summary', 'skill_groups', 'work_history'],
 }
 
 
@@ -525,63 +558,32 @@ def generate_resume_content(
     api_logs: list[dict] = []
     flow_id = _make_flow_id('resume_generate')
 
-    def _attempt_feedback(reason: str, validation: dict | None = None) -> str:
-        parts = [reason.strip()]
-        if validation:
-            if validation.get('missing_required_techs'):
-                parts.append('Missing required stack coverage: ' + ', '.join(validation['missing_required_techs'][:12]) + '.')
-            if validation.get('skills_count'):
-                parts.append(f"technical_skills currently has {validation['skills_count']} items and must be between 60 and 100.")
-            if validation.get('bullet_gaps'):
-                parts.append('Bullet gaps: ' + ' '.join(validation['bullet_gaps'][:6]))
-        return ' '.join(part for part in parts if part)
-
     profile_bullet_counts = (profile.get('generation_settings') or {}).get('bullet_counts') or []
 
     if use_ai and api_key:
-        last_exc = None
-        feedback = ''
-        best_resume: dict | None = None
-        best_validation: dict | None = None
-        for attempt in range(1, 4):
-            try:
-                call_result = _generate_with_openai(
-                    profile=profile,
-                    job_description=job_description,
-                    target_role=target_role,
-                    default_prompt=default_prompt,
-                    job_tech_analysis=job_tech_analysis,
-                    validation_feedback=feedback,
-                    flow_id=flow_id,
-                    attempt=attempt,
-                    model=model,
-                )
-                resume = call_result['resume']
-                api_logs.append(call_result['api_log'])
-                validation = _resume_meets_generation_requirements(resume, job_tech_analysis, bullet_counts=profile_bullet_counts)
-                attempts.append({'attempt': attempt, 'validation': validation})
-                api_logs[-1]['post_validation'] = validation
-                # Track best attempt by fewest bullet gaps
-                if best_resume is None or len(validation.get('bullet_gaps', [])) < len((best_validation or {}).get('bullet_gaps', [])):
-                    best_resume = resume
-                    best_validation = validation
-                if validation.get('ok'):
-                    if attempt > 1:
-                        resume['generation_note'] = f'OpenAI generation passed after {attempt} attempts.'
-                    return {'mode': 'openai', 'resume': resume, 'job_tech_analysis': job_tech_analysis, 'attempts': attempts, 'api_logs': api_logs, 'flow_id': flow_id}
-                feedback = _attempt_feedback('Regenerate the full resume and fix the validation failures exactly.', validation)
-            except OpenAITraceError as exc:  # pragma: no cover
-                last_exc = exc
-                if getattr(exc, 'trace', None):
-                    api_logs.append(exc.trace)
-                break
-            except Exception as exc:  # pragma: no cover
-                last_exc = exc
-                break
-        # If we got any OpenAI result at all, use the best one rather than falling back to demo
-        if best_resume is not None and last_exc is None:
-            best_resume['generation_note'] = f'OpenAI generation used best attempt after validation gaps: {feedback}'
-            return {'mode': 'openai', 'resume': best_resume, 'job_tech_analysis': job_tech_analysis, 'attempts': attempts, 'api_logs': api_logs, 'flow_id': flow_id}
+        try:
+            call_result = _generate_with_openai(
+                profile=profile,
+                job_description=job_description,
+                target_role=target_role,
+                default_prompt=default_prompt,
+                job_tech_analysis=job_tech_analysis,
+                validation_feedback='',
+                flow_id=flow_id,
+                attempt=1,
+                model=model,
+            )
+            resume = call_result['resume']
+            api_logs.append(call_result['api_log'])
+            validation = _resume_meets_generation_requirements(resume, job_tech_analysis, bullet_counts=profile_bullet_counts)
+            attempts.append({'attempt': 1, 'validation': validation})
+            api_logs[-1]['post_validation'] = validation
+            return {'mode': 'openai', 'resume': resume, 'job_tech_analysis': job_tech_analysis, 'attempts': attempts, 'api_logs': api_logs, 'flow_id': flow_id}
+        except OpenAITraceError as exc:  # pragma: no cover
+            if getattr(exc, 'trace', None):
+                api_logs.append(exc.trace)
+        except Exception:  # pragma: no cover
+            pass
         resume = _generate_demo_resume(
             profile=profile,
             job_description=job_description,
@@ -590,7 +592,7 @@ def generate_resume_content(
             clean_generation=clean_generation,
             job_tech_analysis=job_tech_analysis,
         )
-        resume['generation_note'] = f'Fell back to demo mode because OpenAI request failed: {last_exc}'
+        resume['generation_note'] = 'Fell back to demo mode because OpenAI request failed.'
         return {'mode': 'demo-fallback', 'resume': resume, 'job_tech_analysis': job_tech_analysis, 'attempts': attempts, 'api_logs': api_logs, 'flow_id': flow_id}
 
     resume = _generate_demo_resume(
@@ -968,6 +970,8 @@ def _generate_with_openai(profile: dict, job_description: str, target_role: str,
 
     client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
     model = model or os.getenv('OPENAI_MODEL', 'gpt-5.1')
+    profile_id = str(profile.get('id') or '').strip()
+    profile_name = str(profile.get('name') or '').strip()
 
     work_history = profile.get('work_history', []) or []
     work_history_count = len(work_history)
@@ -989,8 +993,8 @@ def _generate_with_openai(profile: dict, job_description: str, target_role: str,
 
     total_years = profile.get('total_years_of_experience')
     summary_char_count = gen_settings.get('summary_char_count')
-    skills_count = gen_settings.get('skills_count') or 65
-    skills_min = max(60, skills_count - 5)
+    skills_count = gen_settings.get('skills_count') or 85
+    skills_min = max(80, skills_count - 5)
     skills_max = skills_count + 5
 
     if total_years:
@@ -999,14 +1003,22 @@ def _generate_with_openai(profile: dict, job_description: str, target_role: str,
         years_rule = 'Calculate the candidate total years of experience by counting from the earliest company start date in the work history to the present, and state it accurately in the summary (e.g., "12+ years of experience").'
 
     if summary_char_count:
-        summary_rule = f'The professional summary must be flowing prose (no bullets), between {summary_char_count - 80} and {summary_char_count + 80} characters total. After writing it, set summary_char_count to the exact character count of the summary string.'
+        summary_rule = f'The professional summary must be flowing prose (no bullets), between {summary_char_count - 80} and {summary_char_count + 80} characters total.'
     else:
-        summary_rule = 'The professional summary must be 7 to 9 sentences of flowing prose (no bullets), roughly 800 to 1100 characters. After writing it, set summary_char_count to the exact character count of the summary string.'
+        summary_rule = 'The professional summary must be 7 to 9 sentences of flowing prose (no bullets), roughly 800 to 1100 characters.'
+
+    identity_rule = (
+        f'This resume is exclusively for {profile_name} (profile_id={profile_id}). '
+        f'Write every sentence — summary, bullets, skills — as if you have never written a resume before. '
+        f'Do NOT reuse any wording, sentence structure, bullet pattern, or phrasing from any prior generation. '
+        f'The voice, vocabulary, and technical emphasis must be unique to this specific candidate and this specific job. '
+    ) if profile_name else ''
 
     developer_message = (
         'You are a senior resume writer and ATS optimizer. Build the resume from a clean slate every time. '
         'Do not rely on previous resumes, previous generations, examples, or any historical context outside the current request payload. '
         'Use only the current work history, job description, and prompt guidance provided in the payload. '
+        f'{identity_rule}'
 
         'STEP 1 — TECHNOLOGY TIMELINE ENFORCEMENT (do this before writing anything): '
         'For each company in the work history, note its date range. Then apply these rules strictly: '
@@ -1024,6 +1036,7 @@ def _generate_with_openai(profile: dict, job_description: str, target_role: str,
         'frameworks, libraries, platforms, cloud services, databases, developer tools, testing tools, CI/CD tools, observability tools, and AI tooling. '
         'No soft skills, generic concepts, or vague architecture labels. '
         'Return skill_groups with categories: Languages, Frontend, Backend, Databases, Cloud & Infrastructure, DevOps & CI/CD, Testing, Observability & Monitoring, Security, Messaging & Streaming, AI/ML & Data. '
+        'Each category must have at least 10 items. Pad with closely related tools if needed to reach 10. '
 
         'STEP 3 — PROFESSIONAL SUMMARY: '
         f'{years_rule} '
@@ -1050,12 +1063,9 @@ def _generate_with_openai(profile: dict, job_description: str, target_role: str,
         '"Strengthened reliability and delivery confidence", "Contributed as a ... in a fast-moving environment", '
         '"modern tools", "backend services", "cloud-based systems", "web technologies". '
         'Vary verbs: architect, own, design, ship, build, migrate, harden, instrument, refactor, mentor, lead, automate, optimize, integrate, debug, profile, partner, scale, reduce. '
-        'For each work_history item, also return bullet_count set to the exact integer count of bullets you wrote. '
-
         'STEP 6 — VALIDATION: '
-        'Before returning, verify: (a) summary_char_count equals len(summary), '
-        f'(b) each company has exactly its target bullet count, (c) skill_groups total {skills_min}–{skills_max} items, '
-        '(d) no timeline violations. If validation feedback is provided, fix every issue first. '
+        f'Before returning, verify: (a) each company has exactly its target bullet count, (b) skill_groups total {skills_min}–{skills_max} items, '
+        '(c) no timeline violations. If any check fails, fix it before returning. '
 
         'Return only JSON matching the schema. Each work_history item references the source company by company_index (0-based) only — '
         'company_name, duration, and location are filled locally by the app.'
@@ -1069,7 +1079,6 @@ def _generate_with_openai(profile: dict, job_description: str, target_role: str,
             {'index': idx, 'target_bullets': _bullet_target(idx)}
             for idx in range(work_history_count)
         ],
-        'validation_feedback': validation_feedback,
     }
 
     content, api_log = _openai_json_schema_call(
@@ -1082,6 +1091,7 @@ def _generate_with_openai(profile: dict, job_description: str, target_role: str,
         flow_id=flow_id or _make_flow_id('resume_generate'),
         call_kind='generate_resume',
         attempt=attempt,
+        user_id=profile_id,
     )
 
     return {
@@ -1126,8 +1136,6 @@ def _update_with_openai(profile: dict, job_description: str, current_resume: dic
         'Every bullet must be long enough to wrap to exactly 2 printed lines — never write a 1-line bullet. '
         'No two bullets across the whole resume may share the same opening verb or repeat the same wording. '
         'Avoid generic filler: "delivered production work", "collaborated with stakeholders", "strengthened reliability and delivery confidence", "contributed in a fast-moving environment". '
-        'For each work_history item, return bullet_count set to the exact integer count of bullets written. '
-        'Set summary_char_count to the exact character count of the summary string. '
         'Return the full revised resume in the required JSON schema, not a partial patch.'
     )
 
@@ -1195,12 +1203,12 @@ def _generate_demo_resume(profile: dict, job_description: str, target_role: str,
         })
 
     summary = _build_summary(profile, inferred_title, prioritized_skills[:10], effective_prompt)
-    skill_groups = _group_skills_for_resume(prioritized_skills[:70], extracted_keywords)
+    skill_groups = _group_skills_for_resume(prioritized_skills[:100], extracted_keywords)
 
     return _normalize_resume({
         'headline': headline,
         'summary': summary,
-        'technical_skills': prioritized_skills[:70],
+        'technical_skills': prioritized_skills[:100],
         'skill_groups': skill_groups,
         'fit_keywords': extracted_keywords[:18],
         'work_history': work_history,
@@ -1215,7 +1223,7 @@ def _update_demo_resume(profile: dict, job_description: str, current_resume: dic
     expanded_stack = analysis.get('expanded_techs', [])
     prioritized_skills = _prioritize_skills(expanded_stack or profile.get('technical_skills', []), extracted_keywords)
     updated['fit_keywords'] = _dedupe_preserve_order((updated.get('fit_keywords', []) or []) + extracted_keywords)[:18]
-    updated['technical_skills'] = prioritized_skills[:70]
+    updated['technical_skills'] = prioritized_skills[:100]
     updated['skill_groups'] = _group_skills_for_resume(updated.get('technical_skills', []), extracted_keywords)
 
     fix_lower = (fix_prompt or '').lower()
@@ -1422,20 +1430,89 @@ def _normalize_resume(resume: dict, profile: dict, target_role: str, job_descrip
             'bullets': bullets,
         })
 
-    generated_groups = _normalize_skill_groups(resume.get('skill_groups', []))
-    grouped_input_items = [item for group in generated_groups for item in group.get('items', [])]
-    grouped_input_items = [item for item in grouped_input_items if _is_technical_stack_item(item)]
-    skills_count = gen_settings.get('skills_count') or 65
-    skills_min = max(60, skills_count - 5)
+    ai_groups = _normalize_skill_groups(resume.get('skill_groups', []))
+    skills_count = gen_settings.get('skills_count') or 85
+    skills_min = max(80, skills_count - 5)
     skills_max = skills_count + 5
-    technical_skills = _ensure_tech_range(_dedupe_preserve_order(grouped_input_items), expanded_stack, minimum=skills_min, maximum=skills_max)
-    generated_groups = _group_skills_for_resume(technical_skills, extracted)
+
+    import random as _random
+    profile_id = str(profile.get('id') or '').strip()
+    # Per-profile seed: shuffle items within categories so different profiles
+    # get different orderings even when the AI returns identical category lists.
+    _rng = _random.Random(profile_id or None)
+
+    if ai_groups:
+        # Trust AI's groups directly — accept any string, no static filter
+        seen_items: set[str] = set()
+        all_ai_items: list[str] = []
+        for group in ai_groups:
+            for item in group.get('items', []):
+                key = item.strip().lower()
+                if key and key not in seen_items:
+                    seen_items.add(key)
+                    all_ai_items.append(item.strip())
+
+        # Pad each category to at least 10 using items from other AI groups (not static pool)
+        padded_groups: list[dict] = []
+        used_for_padding: set[str] = set()
+        for group in ai_groups:
+            items = [i.strip() for i in group.get('items', []) if i.strip()]
+            items = list(dict.fromkeys(items))  # dedupe within category
+            # Shuffle within the category using profile-specific seed
+            _rng.shuffle(items)
+            used_for_padding.update(i.lower() for i in items)
+            padded_groups.append({'category': group['category'], 'items': items})
+
+        # If any category is under 10, pull from other AI categories
+        extra_pool = [i for i in all_ai_items if i.lower() not in used_for_padding]
+        for group in padded_groups:
+            if len(group['items']) < 10:
+                needed = 10 - len(group['items'])
+                for extra in list(extra_pool):
+                    if extra.lower() not in {i.lower() for i in group['items']}:
+                        group['items'].append(extra)
+                        extra_pool.remove(extra)
+                        needed -= 1
+                        if needed == 0:
+                            break
+
+        # Flatten to flat skills list (preserving group order)
+        technical_skills_flat: list[str] = []
+        flat_seen: set[str] = set()
+        for group in padded_groups:
+            for item in group['items']:
+                key = item.lower()
+                if key not in flat_seen:
+                    flat_seen.add(key)
+                    technical_skills_flat.append(item)
+
+        # Pad to skills_min from expanded_stack if still short
+        if len(technical_skills_flat) < skills_min:
+            for tech in (expanded_stack or []) + KNOWN_TECH_TERMS:
+                if tech.lower() not in flat_seen:
+                    flat_seen.add(tech.lower())
+                    technical_skills_flat.append(tech)
+                    # Add to the last group as a catch-all
+                    if padded_groups:
+                        padded_groups[-1]['items'].append(tech)
+                if len(technical_skills_flat) >= skills_min:
+                    break
+
+        technical_skills = technical_skills_flat[:skills_max]
+        generated_groups = padded_groups
+    else:
+        # No AI groups: fall back to static rebuild
+        grouped_input_items = _ensure_tech_range(
+            _dedupe_preserve_order([i for g in [] for i in g.get('items', [])]),
+            expanded_stack, minimum=skills_min, maximum=skills_max
+        )
+        technical_skills = grouped_input_items
+        generated_groups = _group_skills_for_resume(technical_skills, extracted)
 
     summary = resume.get('summary') or _build_summary(profile, inferred_title, technical_skills, '')
     normalized = {
         'headline': resume.get('headline') or _infer_resume_headline(inferred_title, technical_skills),
         'summary': summary,
-        'summary_char_count': len(summary),
         'technical_skills': technical_skills,
         'skill_groups': generated_groups,
         'fit_keywords': extracted[:18],
@@ -1603,6 +1680,8 @@ def _prioritize_skills(profile_skills: list[str], jd_keywords: list[str]) -> lis
 
 
 
+_CATEGORY_MIN_ITEMS = 10
+
 def _group_skills_for_resume(skills: list[str], keywords: list[str]) -> list[dict]:
     deduped_skills = [skill for skill in _dedupe_preserve_order(skills) if _is_technical_stack_item(skill)]
     normalized_lookup = {_canonical_term(skill).lower(): skill for skill in deduped_skills}
@@ -1621,11 +1700,28 @@ def _group_skills_for_resume(skills: list[str], keywords: list[str]) -> list[dic
                 matches.append(normalized_lookup[key])
                 used.add(normalized_lookup[key])
         if matches:
+            # Pad to minimum using the category's alias pool
+            if len(matches) < _CATEGORY_MIN_ITEMS:
+                for alias in CATEGORY_ALIASES[category]:
+                    if len(matches) >= _CATEGORY_MIN_ITEMS:
+                        break
+                    if alias not in used and alias not in matches:
+                        matches.append(alias)
+                        used.add(alias)
             grouped.append({'category': category, 'items': matches})
 
     extras = [skill for skill in deduped_skills if skill not in used]
     if extras:
-        grouped.append({'category': 'Other Relevant', 'items': extras})
+        # Try to pad existing small groups with extras before adding Other Relevant
+        for group in grouped:
+            if len(group['items']) < _CATEGORY_MIN_ITEMS and extras:
+                needed = _CATEGORY_MIN_ITEMS - len(group['items'])
+                group['items'].extend(extras[:needed])
+                used.update(extras[:needed])
+                extras = extras[needed:]
+        remaining = [s for s in extras if s not in used]
+        if remaining:
+            grouped.append({'category': 'Other Relevant', 'items': remaining})
     return grouped
 
 
@@ -1654,9 +1750,14 @@ def _canonical_term(value: str) -> str:
 
 
 
+_KNOWN_TECH_LOWER: set[str] = {t.lower() for t in KNOWN_TECH_TERMS}
+
 def _is_technical_stack_item(value: str) -> bool:
     canonical = _canonical_term(value)
-    return canonical in KNOWN_TECH_TERMS
+    if canonical in KNOWN_TECH_TERMS:
+        return True
+    # Also accept anything whose canonical form is in the known set (case-insensitive)
+    return canonical.lower() in _KNOWN_TECH_LOWER
 
 
 def _extract_explicit_jd_techs(job_description: str) -> list[str]:
@@ -1685,6 +1786,13 @@ def _ensure_tech_range(existing: list[str], required_stack: list[str], minimum: 
                     combined.append(tech)
                 if len(combined) >= minimum:
                     break
+            if len(combined) >= minimum:
+                break
+    # Final fallback: pad from KNOWN_TECH_TERMS (covers languages + professional skills)
+    if len(combined) < minimum:
+        for tech in KNOWN_TECH_TERMS:
+            if tech not in combined:
+                combined.append(tech)
             if len(combined) >= minimum:
                 break
     return combined[:maximum]
@@ -1944,7 +2052,7 @@ def _resume_meets_generation_requirements(resume: dict, job_tech_analysis: dict,
         bullet_gaps.append(f'{duplicate_bullets} bullet(s) duplicate wording across companies; rewrite each to be unique.')
 
     ok = (
-        60 <= len(technical_skills) <= 100
+        80 <= len(technical_skills) <= 100
         and not bullet_gaps
         and len(missing_required_techs) <= 8
         and duplicate_bullets == 0

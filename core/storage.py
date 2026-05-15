@@ -261,6 +261,7 @@ def _normalize_profile(item: dict) -> dict:
             for edu in item.get('education_history', []) or []
         ],
         'generation_settings': _normalize_generation_settings(item.get('generation_settings')),
+        'resume_template': str(item.get('resume_template') or 'spear-1').strip() or 'spear-1',
     }
 
 

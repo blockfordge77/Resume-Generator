@@ -2551,6 +2551,17 @@ def profile_settings_page(user: dict) -> None:
 
                         portfolio = st.text_input('Portfolio / GitHub', value=selected_profile.get('portfolio', ''), disabled=not can_edit)
 
+                        _template_options = ['spear-1', 'spear-2']
+                        _cur_template = selected_profile.get('resume_template') or 'spear-1'
+                        _cur_template = _cur_template if _cur_template in _template_options else 'spear-1'
+                        resume_template = st.selectbox(
+                            'Resume template',
+                            _template_options,
+                            index=_template_options.index(_cur_template),
+                            disabled=not can_edit,
+                            help='spear-1: blue headings, experience-first. spear-2: black headings, summary/skills/education-first.',
+                        )
+
                         st.markdown('**Resume DOCX**')
                         if can_edit:
                             uploaded_resume = st.file_uploader('Upload resume DOCX', type=['docx'], label_visibility='collapsed', help='DOCX only. Generated PDF preserves this style.')
@@ -2594,11 +2605,11 @@ def profile_settings_page(user: dict) -> None:
                         with gs_c3:
                             skills_count = st.number_input(
                                 'Skills count',
-                                min_value=60, max_value=100,
-                                value=int(_existing_gen.get('skills_count') or 65),
+                                min_value=80, max_value=100,
+                                value=max(80, int(_existing_gen.get('skills_count') or 85)),
                                 step=1,
                                 disabled=not can_edit,
-                                help='Target number of technical skills (60–100).',
+                                help='Target number of technical skills (80–100).',
                             )
 
                         _pid_key = selected_profile.get('id', 'new')
@@ -2659,6 +2670,7 @@ def profile_settings_page(user: dict) -> None:
                             'region': _normalize_region(region),
                             'linkedin': linkedin.strip(),
                             'portfolio': portfolio.strip(),
+                            'resume_template': resume_template,
                             'default_template_id': '',
                             'total_years_of_experience': int(total_years_of_experience) if total_years_of_experience else 0,
                             'work_history': _parse_work_history(work_history_text),

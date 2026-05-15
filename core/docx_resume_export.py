@@ -1012,6 +1012,55 @@ def _replace_skills_with_bold_categories(doc: Document, resume: dict) -> bool:
     return True
 
 
+def _trim_skills_to_fit(doc: Document, resume: dict, max_lines: int = 20) -> None:
+    """Trim skill items per category until the skills section fits within max_lines.
+
+    Each category row = 1 printed paragraph. We estimate its rendered line count
+    at ~95 chars/line. If total skill lines exceed max_lines, we remove items from
+    the end of the largest categories first until it fits.
+    """
+    _CHARS_PER_LINE = 95
+
+    def _group_line_count(category: str, items: list[str]) -> int:
+        line_text = f"{category}   {', '.join(items)}" if category else ', '.join(items)
+        return max(1, -(-len(line_text) // _CHARS_PER_LINE))
+
+    skill_groups = _skill_groups_for_rendering(resume)
+    if not skill_groups:
+        return
+
+    total = sum(_group_line_count(g['category'], g['items']) for g in skill_groups)
+    if total <= max_lines:
+        return
+
+    # Trim items from the end of the largest groups first, one item at a time
+    groups = [{'category': g['category'], 'items': list(g['items'])} for g in skill_groups]
+    while total > max_lines:
+        # Find group with most items that still has >1 item
+        target = max((g for g in groups if len(g['items']) > 1), key=lambda g: len(g['items']), default=None)
+        if target is None:
+            break
+        old_lines = _group_line_count(target['category'], target['items'])
+        target['items'].pop()
+        new_lines = _group_line_count(target['category'], target['items'])
+        total -= (old_lines - new_lines)
+
+    # Write trimmed groups back into the doc
+    paragraphs = _all_body_paragraphs(doc)
+    section_range = _find_section_range(paragraphs, "skills")
+    if not section_range:
+        return
+    start, end = section_range
+    body = paragraphs[start + 1:end]
+    content_body = [p for p in body if _clean_text(p.text) and not _is_decorative_or_blank_paragraph(p)]
+    if not content_body:
+        return
+    anchor = content_body[0]
+    for p in content_body[1:]:
+        _delete_paragraph(p)
+    _write_skill_groups_bold_categories(anchor, groups)
+
+
 def _strip_paragraph_borders(doc: Document) -> None:
     """Remove any w:pBdr from every paragraph (template cleanup before content is written)."""
     for paragraph in doc.paragraphs:
@@ -1023,28 +1072,60 @@ def _strip_paragraph_borders(doc: Document) -> None:
             pPr.remove(pBdr)
 
 
-def _inject_section_heading_borders(doc: Document) -> None:
-    """Add a blue bottom border to section headings only (called after all content is written).
+def _is_section_heading_paragraph(p, resume_template: str) -> bool:
+    """Return True if this paragraph element is a section heading (not the Full Name).
 
-    Section headings (PROFESSIONAL SUMMARY, PROFESSIONAL EXPERIENCE, EDUCATION,
-    TECHNICAL SKILLS) are identified by having at least one run with w:color=00B0F0.
-    The Full Name paragraph (Heading 3, no blue color) is intentionally skipped.
-    No page-break attributes are added.
+    spear-1: headings have runs with w:color=00B0F0.
+    spear-2: headings are Heading 3 with w:color=000000 AND font size ≤ 28 half-pts
+             (the Full Name is 72 half-pts and is excluded this way).
     """
-    for paragraph in doc.paragraphs:
-        p = paragraph._p
-
-        # detect blue-colored run
-        has_blue_run = False
+    if resume_template == 'spear-2':
+        # Must have a black-colored run
+        has_black_run = False
+        for rPr in p.iter(qn("w:rPr")):
+            color_el = rPr.find(qn("w:color"))
+            if color_el is not None:
+                val = (color_el.get(qn("w:val")) or "").upper()
+                if val == "000000":
+                    has_black_run = True
+                    break
+        if not has_black_run:
+            return False
+        # Exclude the Full Name by font size (name = 72 half-pts, headings ≤ 28)
+        for rPr in p.iter(qn("w:rPr")):
+            sz = rPr.find(qn("w:sz"))
+            if sz is not None:
+                try:
+                    if int(sz.get(qn("w:val"), "0")) > 28:
+                        return False
+                except ValueError:
+                    pass
+        return True
+    else:
+        # spear-1: blue run color marks section headings
         for rPr in p.iter(qn("w:rPr")):
             color_el = rPr.find(qn("w:color"))
             if color_el is not None:
                 val = (color_el.get(qn("w:val")) or "").upper()
                 if val == "00B0F0":
-                    has_blue_run = True
-                    break
+                    return True
+        return False
 
-        if not has_blue_run:
+
+def _inject_section_heading_borders(doc: Document, resume_template: str = 'spear-1') -> None:
+    """Add a border to section headings only (called after all content is written).
+
+    spear-1: blue (00B0F0) bottom border — line sits below the heading text.
+    spear-2: black (000000) top border — line sits above the heading text.
+    Full Name paragraph is always excluded. No page-break attributes added.
+    """
+    border_color = "000000" if resume_template == 'spear-2' else "00B0F0"
+    border_side = "top" if resume_template == 'spear-2' else "bottom"
+
+    for paragraph in doc.paragraphs:
+        p = paragraph._p
+
+        if not _is_section_heading_paragraph(p, resume_template):
             continue
 
         pPr = p.find(qn("w:pPr"))
@@ -1058,16 +1139,24 @@ def _inject_section_heading_borders(doc: Document) -> None:
             pPr.remove(existing)
 
         new_pBdr = OxmlElement("w:pBdr")
-        bottom = OxmlElement("w:bottom")
-        bottom.set(qn("w:val"), "single")
-        bottom.set(qn("w:sz"), "6")
-        bottom.set(qn("w:space"), "1")
-        bottom.set(qn("w:color"), "00B0F0")
-        new_pBdr.append(bottom)
+        border_el = OxmlElement(f"w:{border_side}")
+        border_el.set(qn("w:val"), "single")
+        border_el.set(qn("w:sz"), "6")
+        border_el.set(qn("w:space"), "1")
+        border_el.set(qn("w:color"), border_color)
+        new_pBdr.append(border_el)
         pPr.append(new_pBdr)
 
+        # spear-2: add space after the heading so text below isn't flush against the border
+        if resume_template == 'spear-2':
+            spacing = pPr.find(qn("w:spacing"))
+            if spacing is None:
+                spacing = OxmlElement("w:spacing")
+                pPr.insert(0, spacing)
+            spacing.set(qn("w:after"), "80")
 
-def apply_resume_to_docx(docx_path: Path, resume: dict) -> None:
+
+def apply_resume_to_docx(docx_path: Path, resume: dict, resume_template: str = 'spear-1') -> None:
     doc = Document(str(docx_path))
     headline = _plain_resume_text(resume.get("headline", ""))
     summary = _plain_resume_text(resume.get("summary", ""))
@@ -1096,7 +1185,10 @@ def apply_resume_to_docx(docx_path: Path, resume: dict) -> None:
         if skills:
             _replace_section_body(doc, "skills", skills, force_no_bold=True)
 
-    # Experience: replace bullets, then insert page breaks after companies 1 and 3
+    # spear-1: trim skill items if the section would overflow its page budget
+    if resume_template != 'spear-2':
+        _trim_skills_to_fit(doc, resume, max_lines=20)
+
     experience_lines = []
     for job_index, job in enumerate(resume.get("work_history", []) or []):
         if job_index:
@@ -1124,8 +1216,12 @@ def apply_resume_to_docx(docx_path: Path, resume: dict) -> None:
         if not _replace_placeholders(doc, EXPERIENCE_PLACEHOLDERS, experience_lines, keywords=tech_keywords):
             _replace_experience_bullets_and_titles(doc, resume)
 
-    # Add blue bottom border to section headings (after all content is in place)
-    _inject_section_heading_borders(doc)
+    # spear-2: forced page breaks — education end → new page, company 2 end → new page
+    if resume_template == 'spear-2':
+        _insert_spear2_page_breaks(doc, resume)
+
+    # Section heading borders — style depends on template
+    _inject_section_heading_borders(doc, resume_template=resume_template)
 
     doc.save(str(docx_path))
 
@@ -1186,6 +1282,144 @@ def _insert_experience_page_breaks(doc: Document, resume: dict) -> None:
                 bullet_group_last2.append(current_group2[-1])
             if len(bullet_group_last2) >= 3:
                 _insert_page_break_after(bullet_group_last2[2])
+
+
+def _insert_spear2_page_breaks(doc: Document, resume: dict) -> None:
+    """spear-2 layout: page 1 = header+summary+skills+education, page 2 = companies 1+2, page 3 = companies 3+4.
+
+    Inserts two page breaks:
+      1. After the last paragraph of the Education section → Experience starts on page 2.
+      2. After company 2's last bullet inside Experience → companies 3+4 start on page 3.
+    """
+    paragraphs = _all_body_paragraphs(doc)
+
+    # --- Break 1: after Education section end ---
+    edu_range = _find_section_range(paragraphs, "education")
+    if edu_range:
+        edu_start, edu_end = edu_range
+        # Remove ALL empty paragraphs between the last education content and the
+        # next section heading — they come from the template and would create a
+        # blank gap at the top of page 2.
+        empty_to_remove = []
+        for idx in range(edu_end - 1, edu_start, -1):
+            if not (paragraphs[idx].text or "").strip():
+                empty_to_remove.append(paragraphs[idx])
+            else:
+                break
+        for ep in empty_to_remove:
+            ep._p.getparent().remove(ep._p)
+
+        # Re-query after deletions
+        paragraphs = _all_body_paragraphs(doc)
+        edu_range = _find_section_range(paragraphs, "education")
+        if edu_range:
+            edu_start, edu_end = edu_range
+            # Insert page break after the last non-empty education paragraph
+            insert_after_idx = edu_end - 1
+            while insert_after_idx > edu_start and not (paragraphs[insert_after_idx].text or "").strip():
+                insert_after_idx -= 1
+            _insert_page_break_after(paragraphs[insert_after_idx])
+
+    # --- Break 2: after company 2's last bullet inside Experience ---
+    # Re-query after first break shifted offsets
+    paragraphs2 = _all_body_paragraphs(doc)
+    exp_range2 = _find_section_range(paragraphs2, "experience")
+    if not exp_range2:
+        return
+    exp_start2, exp_end2 = exp_range2
+    exp_body2 = paragraphs2[exp_start2 + 1:exp_end2]
+
+    # Collect bullet groups (one group = one company's bullets)
+    bullet_groups: list[list[Paragraph]] = []
+    current_group2: list[Paragraph] = []
+    for paragraph in exp_body2:
+        if _paragraph_looks_like_bullet_content(paragraph):
+            current_group2.append(paragraph)
+        else:
+            if current_group2:
+                bullet_groups.append(current_group2)
+                current_group2 = []
+    if current_group2:
+        bullet_groups.append(current_group2)
+
+    if len(bullet_groups) < 2:
+        return
+
+    # Trim company 2 bullets if they overflow page 2.
+    # Page 2 holds companies 1+2. Estimate lines at ~95 chars/line, ~43 printable
+    # lines per page. Each bullet = 2 lines (120-175 chars). Non-bullet rows = 1 line.
+    _CHARS_PER_LINE = 95
+    _LINES_PER_PAGE = 43
+
+    def _estimated_lines(p: Paragraph) -> int:
+        text = (p.text or '').strip()
+        if not text:
+            return 1
+        return max(1, -(-len(text) // _CHARS_PER_LINE))  # ceiling division
+
+    # Build id sets for fast identity checks
+    co1_ids = {id(p) for p in bullet_groups[0]}
+    co2_bullets = bullet_groups[1]
+    co2_ids = {id(p) for p in co2_bullets}
+
+    # Split exp_body2 into: company1 block (up to and including co1 last bullet),
+    # company2 block (everything after co1 last bullet up to and including co2 last bullet)
+    co1_last_id = id(bullet_groups[0][-1])
+    co2_last_id = id(co2_bullets[-1]) if co2_bullets else None
+
+    co1_block: list[Paragraph] = []
+    co2_block: list[Paragraph] = []
+    in_co2_block = False
+    for p in exp_body2:
+        if not in_co2_block:
+            co1_block.append(p)
+            if id(p) == co1_last_id:
+                in_co2_block = True
+        else:
+            co2_block.append(p)
+            if co2_last_id and id(p) == co2_last_id:
+                break
+
+    # page2 = exp heading + co1 block + co2 block
+    page2_lines = 1  # PROFESSIONAL EXPERIENCE heading
+    page2_lines += sum(_estimated_lines(p) for p in co1_block)
+    page2_lines += sum(_estimated_lines(p) for p in co2_block)
+    overflow_lines = page2_lines - _LINES_PER_PAGE
+
+    # Drop bullets from the end of company 2 until it fits
+    if overflow_lines > 0 and co2_bullets:
+        bullets_to_drop: list[Paragraph] = []
+        freed = 0
+        for bp in reversed(co2_bullets):
+            if freed >= overflow_lines:
+                break
+            freed += _estimated_lines(bp)
+            bullets_to_drop.append(bp)
+        for bp in bullets_to_drop:
+            bp._p.getparent().remove(bp._p)
+
+    # Re-query after potential removals
+    paragraphs3 = _all_body_paragraphs(doc)
+    exp_range3 = _find_section_range(paragraphs3, "experience")
+    if not exp_range3:
+        return
+    exp_start3, exp_end3 = exp_range3
+    exp_body3 = paragraphs3[exp_start3 + 1:exp_end3]
+
+    bullet_group_last3: list[Paragraph] = []
+    current_group3: list[Paragraph] = []
+    for paragraph in exp_body3:
+        if _paragraph_looks_like_bullet_content(paragraph):
+            current_group3.append(paragraph)
+        else:
+            if current_group3:
+                bullet_group_last3.append(current_group3[-1])
+                current_group3 = []
+    if current_group3:
+        bullet_group_last3.append(current_group3[-1])
+
+    if len(bullet_group_last3) >= 2:
+        _insert_page_break_after(bullet_group_last3[1])
 
 
 def find_soffice() -> str | None:
@@ -1412,7 +1646,8 @@ def build_docx_style_pdf_bundle(resume: dict, profile: dict, output_dir: Path | 
         working_docx = temp_dir / "styled_resume.docx"
         pdf_path = temp_dir / "styled_resume.pdf"
         shutil.copy2(source_docx, working_docx)
-        apply_resume_to_docx(working_docx, resume)
+        resume_template = str(profile.get('resume_template') or 'spear-1').strip() or 'spear-1'
+        apply_resume_to_docx(working_docx, resume, resume_template=resume_template)
         ok, message = export_pdf(working_docx, pdf_path, pdf_cfg or {})
         pdf_bytes = pdf_path.read_bytes() if ok and pdf_path.exists() else b""
         docx_bytes = working_docx.read_bytes()
