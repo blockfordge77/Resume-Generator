@@ -2708,6 +2708,64 @@ def _openai_call_index() -> dict[tuple[str, date], int]:
     return index
 
 
+def _added_jobs_index() -> dict[tuple[str, date], int]:
+    """Aggregate user-added job counts by (user_id, date). Excludes admin batch uploads and system reports."""
+    index: dict[tuple[str, date], int] = {}
+    for job in storage.get_jobs(include_pending=True):
+        submitted_dt = _safe_parse_datetime(job.get('submitted_at', ''))
+        user_id = str(job.get('created_by_user_id', '') or '').strip()
+        source = str(job.get('source', '') or '').strip().lower()
+        if not submitted_dt or not user_id:
+            continue
+        if source not in {'manual', 'extension'}:
+            continue
+        key = (user_id, submitted_dt.date())
+        index[key] = index.get(key, 0) + 1
+    return index
+
+
+def _build_weekly_added_jobs_rows(users: list[dict], selected_week_start: date) -> list[dict]:
+    day_offsets = [
+        ('Mon', 0),
+        ('Tue', 1),
+        ('Wed', 2),
+        ('Thu', 3),
+        ('Fri', 4),
+        ('Sat', 5),
+        ('Sun', 6),
+    ]
+    jobs_index = _added_jobs_index()
+    summary_rows: list[dict] = []
+    for member in users:
+        uid = str(member.get('id', ''))
+        member_name = member.get('full_name') or member.get('username') or 'Unknown'
+        row: dict = {'User': member_name}
+        week_total = 0
+        for label, offset in day_offsets:
+            day_date = selected_week_start + timedelta(days=offset)
+            count = int(jobs_index.get((uid, day_date), 0))
+            row[label] = count
+            week_total += count
+        row['Sum'] = week_total
+        summary_rows.append(row)
+    return sorted(summary_rows, key=lambda item: str(item.get('User', '')).lower())
+
+
+def _added_jobs_column_config() -> dict:
+    day_help = 'Jobs added that day (one-by-one form or browser extension submissions; batch uploads excluded).'
+    return {
+        'User': st.column_config.TextColumn('User', help='Approved user (full name or username).'),
+        'Mon': st.column_config.NumberColumn('Mon', help=day_help),
+        'Tue': st.column_config.NumberColumn('Tue', help=day_help),
+        'Wed': st.column_config.NumberColumn('Wed', help=day_help),
+        'Thu': st.column_config.NumberColumn('Thu', help=day_help),
+        'Fri': st.column_config.NumberColumn('Fri', help=day_help),
+        'Sat': st.column_config.NumberColumn('Sat', help=day_help),
+        'Sun': st.column_config.NumberColumn('Sun', help=day_help),
+        'Sum': st.column_config.NumberColumn('Sum', help='Weekly total of jobs added by this user.'),
+    }
+
+
 def _build_weekly_summary_rows(rows: list[dict], users: list[dict], selected_week_start: date, include_openai: bool = True) -> list[dict]:
     day_offsets = [
         ('Mon', 0),
@@ -2786,6 +2844,15 @@ def _render_application_metrics_tab() -> None:
         column_config=_application_metrics_column_config(),
     )
 
+    st.markdown('**Jobs added by user**')
+    added_jobs_rows = _build_weekly_added_jobs_rows(users, selected_week_start)
+    st.dataframe(
+        added_jobs_rows,
+        use_container_width=True,
+        hide_index=True,
+        column_config=_added_jobs_column_config(),
+    )
+
 
 def _render_schedule_reviews_tab(admin_user: dict) -> None:
     items = storage.get_generated_resumes()
@@ -2857,6 +2924,15 @@ def my_weekly_result_page(user: dict) -> None:
         )
     else:
         st.info('No saved applications for the selected week yet.')
+
+    st.markdown('**Jobs you added this week**')
+    added_jobs_rows = _build_weekly_added_jobs_rows([user], selected_week_start)
+    st.dataframe(
+        added_jobs_rows,
+        use_container_width=True,
+        hide_index=True,
+        column_config=_added_jobs_column_config(),
+    )
 
     week_end = selected_week_start + timedelta(days=6)
     schedule_rows = [
@@ -3205,8 +3281,9 @@ def job_list_page(user: dict) -> None:
             if duplicate and not confirm_duplicate:
                 st.warning(f"A matching job already exists: {_job_summary_label(duplicate)}. Tick the confirmation box to add it anyway.")
                 return
-            status = 'approved' if is_admin(user) else 'pending'
+            status = 'approved'
             scrape_status = 'done' if description.strip() else ('queued' if link.strip() else 'done')
+            now_iso = datetime.utcnow().isoformat() + 'Z'
             job_payload = {
                 'id': storage.make_id('job'),
                 'company': company.strip(),
@@ -3221,13 +3298,13 @@ def job_list_page(user: dict) -> None:
                 'scrape_error': '',
                 'created_by_user_id': user.get('id', ''),
                 'created_by_username': user.get('username', ''),
-                'submitted_at': datetime.utcnow().isoformat() + 'Z',
-                'approved_at': datetime.utcnow().isoformat() + 'Z' if status == 'approved' else '',
-                'approved_by_user_id': user.get('id', '') if status == 'approved' else '',
-                'approved_by_username': user.get('username', '') if status == 'approved' else '',
+                'submitted_at': now_iso,
+                'approved_at': now_iso,
+                'approved_by_user_id': user.get('id', ''),
+                'approved_by_username': user.get('username', ''),
             }
             storage.upsert_job(job_payload)
-            st.session_state['job_list_notice'] = 'Job saved.' if status == 'approved' else 'Job submitted for admin approval.'
+            st.session_state['job_list_notice'] = 'Job saved.'
             st.rerun()
 
     if is_admin(user):
