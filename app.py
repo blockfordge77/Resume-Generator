@@ -1877,8 +1877,7 @@ def dashboard_page(user: dict) -> None:
                 st.success(notice)
             exports = st.session_state['last_exports']
             tab_labels = ['Preview', 'Edit & Fix', 'Exports', 'ATS Notes']
-            if is_admin(user):
-                tab_labels.append('Job Application Answers')
+            tab_labels.append('Job Application Answers')
             tab_labels.extend(['Structured Data', 'Source Profile'])
             tab_objects = dict(zip(tab_labels, st.tabs(tab_labels)))
             with tab_objects['Preview']:
