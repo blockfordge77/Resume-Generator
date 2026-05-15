@@ -1025,6 +1025,12 @@ def _trim_skills_to_fit(doc: Document, resume: dict, max_lines: int = 20) -> Non
         line_text = f"{category}   {', '.join(items)}" if category else ', '.join(items)
         return max(1, -(-len(line_text) // _CHARS_PER_LINE))
 
+    def _para_lines(p: Paragraph) -> int:
+        text = (p.text or '').strip()
+        if not text:
+            return 1
+        return max(1, -(-len(text) // _CHARS_PER_LINE))
+
     skill_groups = _skill_groups_for_rendering(resume)
     if not skill_groups:
         return
@@ -1052,6 +1058,94 @@ def _trim_skills_to_fit(doc: Document, resume: dict, max_lines: int = 20) -> Non
         return
     start, end = section_range
     body = paragraphs[start + 1:end]
+    content_body = [p for p in body if _clean_text(p.text) and not _is_decorative_or_blank_paragraph(p)]
+    if not content_body:
+        return
+    anchor = content_body[0]
+    for p in content_body[1:]:
+        _delete_paragraph(p)
+    _write_skill_groups_bold_categories(anchor, groups)
+
+
+def _trim_skills_spear2(doc: Document, resume: dict) -> None:
+    """spear-2 variant: measure everything else on page 1 (header, summary, education)
+    and trim skills so that summary + skills + education all fit within one page.
+
+    Page 1 layout (top to bottom): header block → SUMMARY heading → summary →
+    TECHNICAL SKILLS heading → skills body → EDUCATION heading → education body.
+    We count lines for everything except the skills body, subtract from the
+    page budget, and that gives the skills budget.
+    """
+    _CHARS_PER_LINE = 95
+    _LINES_PER_PAGE = 43
+    # Each section heading on page 1 has a top border + w:spacing after=80 which
+    # adds extra vertical space beyond what character counting captures.
+    # 3 headings on page 1: SUMMARY, SKILLS, EDUCATION → 3 lines of overhead.
+    _HEADING_OVERHEAD = 3
+
+    def _para_lines(p: Paragraph) -> int:
+        text = (p.text or '').strip()
+        # Blank paragraphs still consume vertical space in the printed doc.
+        if not text:
+            return 1
+        return max(1, -(-len(text) // _CHARS_PER_LINE))
+
+    def _group_line_count(category: str, items: list[str]) -> int:
+        line_text = f"{category}   {', '.join(items)}" if category else ', '.join(items)
+        return max(1, -(-len(line_text) // _CHARS_PER_LINE))
+
+    paragraphs = _all_body_paragraphs(doc)
+    skills_range = _find_section_range(paragraphs, "skills")
+    edu_range = _find_section_range(paragraphs, "education")
+    exp_range = _find_section_range(paragraphs, "experience")
+
+    if not skills_range:
+        return
+
+    skills_start, skills_end = skills_range
+
+    # Lines consumed by everything before the skills body (header + summary section + SKILLS heading)
+    pre_skills_lines = sum(_para_lines(p) for p in paragraphs[:skills_start + 1])
+
+    # Lines consumed by education section (heading + body), stopping at experience
+    post_skills_lines = 0
+    if edu_range:
+        edu_start, _ = edu_range
+        edu_end_actual = exp_range[0] if exp_range else len(paragraphs)
+        post_skills_lines = sum(_para_lines(p) for p in paragraphs[edu_start:edu_end_actual])
+
+    fixed_lines = pre_skills_lines + post_skills_lines + _HEADING_OVERHEAD
+    skills_budget = _LINES_PER_PAGE - fixed_lines
+
+    # Minimum of 5 lines so we always show something
+    skills_budget = max(5, skills_budget)
+
+    skill_groups = _skill_groups_for_rendering(resume)
+    if not skill_groups:
+        return
+
+    current_total = sum(_group_line_count(g['category'], g['items']) for g in skill_groups)
+    if current_total <= skills_budget:
+        return
+
+    groups = [{'category': g['category'], 'items': list(g['items'])} for g in skill_groups]
+    while current_total > skills_budget:
+        target = max((g for g in groups if len(g['items']) > 1), key=lambda g: len(g['items']), default=None)
+        if target is None:
+            break
+        old_lines = _group_line_count(target['category'], target['items'])
+        target['items'].pop()
+        new_lines = _group_line_count(target['category'], target['items'])
+        current_total -= (old_lines - new_lines)
+
+    # Write trimmed groups back into the doc
+    # Re-query paragraphs since nothing changed structurally yet
+    paragraphs = _all_body_paragraphs(doc)
+    skills_range = _find_section_range(paragraphs, "skills")
+    if not skills_range:
+        return
+    skills_start, skills_end = skills_range
+    body = paragraphs[skills_start + 1:skills_end]
     content_body = [p for p in body if _clean_text(p.text) and not _is_decorative_or_blank_paragraph(p)]
     if not content_body:
         return
@@ -1185,8 +1279,10 @@ def apply_resume_to_docx(docx_path: Path, resume: dict, resume_template: str = '
         if skills:
             _replace_section_body(doc, "skills", skills, force_no_bold=True)
 
-    # spear-1: trim skill items if the section would overflow its page budget
-    if resume_template != 'spear-2':
+    # Trim skills to fit within their page budget (must run before page breaks are inserted)
+    if resume_template == 'spear-2':
+        _trim_skills_spear2(doc, resume)
+    else:
         _trim_skills_to_fit(doc, resume, max_lines=20)
 
     experience_lines = []
