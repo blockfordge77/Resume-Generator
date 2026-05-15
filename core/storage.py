@@ -48,6 +48,7 @@ class Storage:
         self.users_path = self.data_dir / 'users.json'
         self.jobs_path = self.data_dir / 'jobs.json'
         self.openai_calls_path = self.data_dir / 'openai_calls.json'
+        self.improved_resumes_path = self.data_dir / 'improved_resumes.json'
         self._lock = threading.RLock()
         self._ensure_defaults()
 
@@ -91,6 +92,9 @@ class Storage:
 
             if not self.openai_calls_path.exists():
                 self._write_json(self.openai_calls_path, [])
+
+            if not self.improved_resumes_path.exists():
+                self._write_json(self.improved_resumes_path, [])
 
     def _read_json(self, path: Path) -> Any:
         if not path.exists():
@@ -910,6 +914,76 @@ class Storage:
                     items[index] = self._normalize_jobs([item | {'reports': [], 'flagged': False}])[0]
                     self._write_json(self.jobs_path, items)
                     return
+
+    def get_improved_resume_cache(self, profile_id: str, job_id: str) -> dict | None:
+        profile_id = str(profile_id or '').strip()
+        job_id = str(job_id or '').strip()
+        if not profile_id or not job_id:
+            return None
+        with self._lock:
+            items = self._read_json(self.improved_resumes_path) or []
+            if not isinstance(items, list):
+                return None
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get('profile_id', '')) == profile_id and str(item.get('job_id', '')) == job_id:
+                    return item
+        return None
+
+    def save_improved_resume_cache(self, entry: dict) -> None:
+        profile_id = str((entry or {}).get('profile_id', '')).strip()
+        job_id = str((entry or {}).get('job_id', '')).strip()
+        if not profile_id or not job_id:
+            return
+        with self._lock:
+            items = self._read_json(self.improved_resumes_path) or []
+            if not isinstance(items, list):
+                items = []
+            items = [
+                item for item in items
+                if isinstance(item, dict)
+                and (str(item.get('profile_id', '')) != profile_id or str(item.get('job_id', '')) != job_id)
+            ]
+            items.append(entry)
+            self._write_json(self.improved_resumes_path, items)
+
+    def has_improved_resume_for_job(self, job_id: str, job_description_hash: str) -> bool:
+        """True if any profile produced a successful auto-improve for this job under the current JD hash."""
+        job_id = str(job_id or '').strip()
+        job_description_hash = str(job_description_hash or '').strip()
+        if not job_id or not job_description_hash:
+            return False
+        with self._lock:
+            items = self._read_json(self.improved_resumes_path) or []
+            if not isinstance(items, list):
+                return False
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get('job_id', '')) != job_id:
+                    continue
+                if str(item.get('job_description_hash', '')) != job_description_hash:
+                    continue
+                return True
+        return False
+
+    def delete_improved_resume_cache(self, profile_id: str, job_id: str) -> None:
+        profile_id = str(profile_id or '').strip()
+        job_id = str(job_id or '').strip()
+        if not profile_id or not job_id:
+            return
+        with self._lock:
+            items = self._read_json(self.improved_resumes_path) or []
+            if not isinstance(items, list):
+                return
+            filtered = [
+                item for item in items
+                if isinstance(item, dict)
+                and (str(item.get('profile_id', '')) != profile_id or str(item.get('job_id', '')) != job_id)
+            ]
+            if len(filtered) != len(items):
+                self._write_json(self.improved_resumes_path, filtered)
 
 
 def _template_defaults() -> dict:

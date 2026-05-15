@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import html
 import json
 import os
@@ -1314,6 +1315,10 @@ def _finalize_saved_resume(message: str, status: str) -> None:
     st.session_state['saved_resume_notice'] = 'Resume saved. The PDF was downloaded to your browser.'
     st.session_state['pending_saved_resume'] = None
     st.session_state['company_message_dialog_reset_needed'] = True
+    st.session_state['last_resume'] = None
+    st.session_state['last_resume_job_id'] = ''
+    st.session_state['last_exports'] = {}
+    st.session_state['dashboard_show_preview'] = False
 
 
 def _update_saved_resume_message(item: dict, message: str) -> None:
@@ -1481,6 +1486,72 @@ def _enforce_low_ats_rate_limit(user: dict, job_id: str, ats_score: int) -> bool
         'Job auto-reported and under review. Moved to the next job.'
     )
     return True
+
+
+def _cached_ats_analysis(resume: dict, job_description: str, target_role: str) -> dict:
+    """Memoize analyze_ats_score by (resume, JD, target_role) signature within the session.
+
+    Streamlit reruns on every keystroke, so without this the analyzer is invoked many times
+    against unchanged data. Cache is bounded to 8 most-recent signatures.
+    """
+    payload = {
+        'resume': resume or {},
+        'job_description': job_description or '',
+        'target_role': target_role or '',
+    }
+    signature = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str).encode('utf-8')).hexdigest()
+    cache = st.session_state.setdefault('ats_analysis_cache', {})
+    if signature in cache:
+        return cache[signature]
+    result = analyze_ats_score(resume or {}, job_description or '', target_role=target_role or '')
+    cache[signature] = result
+    if len(cache) > 8:
+        for stale_key in list(cache.keys())[:-8]:
+            cache.pop(stale_key, None)
+    return result
+
+
+def _hash_profile_for_cache(profile: dict) -> str:
+    """Hash the profile fields that drive resume generation. Tagging metadata (region, etc.) is excluded."""
+    if not isinstance(profile, dict):
+        return ''
+    relevant = {
+        'full_name': str(profile.get('full_name', '')).strip(),
+        'headline': str(profile.get('headline', '')).strip(),
+        'summary': str(profile.get('summary', '')).strip(),
+        'technical_skills': profile.get('technical_skills', []) or [],
+        'work_history': profile.get('work_history', []) or [],
+        'education_history': profile.get('education_history', []) or [],
+        'uploaded_resume_text': str(profile.get('uploaded_resume_text', '')).strip(),
+    }
+    payload = json.dumps(relevant, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(payload.encode('utf-8')).hexdigest()
+
+
+def _hash_job_description_for_cache(job_description: str) -> str:
+    text = str(job_description or '').strip()
+    if not text:
+        return ''
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+
+def _load_cached_improved_resume(profile: dict, job_id: str, job_description: str) -> dict | None:
+    """Returns the cached improved resume entry if it matches current profile/JD, else None and clears stale entries."""
+    profile_id = str((profile or {}).get('id', '')).strip()
+    job_id = str(job_id or '').strip()
+    if not profile_id or not job_id:
+        return None
+    entry = storage.get_improved_resume_cache(profile_id, job_id)
+    if not entry:
+        return None
+    expected_profile_hash = _hash_profile_for_cache(profile)
+    expected_jd_hash = _hash_job_description_for_cache(job_description)
+    cached_profile_hash = str(entry.get('profile_hash', '') or '')
+    cached_jd_hash = str(entry.get('job_description_hash', '') or '')
+    if cached_profile_hash != expected_profile_hash or cached_jd_hash != expected_jd_hash:
+        storage.delete_improved_resume_cache(profile_id, job_id)
+        return None
+    return entry
 
 
 def _enforce_auto_improve_one_shot(user: dict, job_id: str, ats_score: int) -> bool:
@@ -1743,11 +1814,24 @@ def dashboard_page(user: dict) -> None:
             use_ai = st.toggle('Use OpenAI', value=True, help='If OPENAI_API_KEY is missing, generation falls back automatically.')
 
         if is_admin(user):
-            with st.expander('Uploaded resume template preview', expanded=False):
+            show_template_preview = st.checkbox(
+                'Show uploaded resume template preview',
+                value=False,
+                key='dashboard_template_preview_visible',
+                help='Off by default. Enable only when you need to inspect the uploaded DOCX; reading it on every rerun slows the dashboard.',
+            )
+            if show_template_preview:
                 _render_uploaded_resume_template_preview(profile, app_settings, 'dashboard_uploaded_template_preview')
 
-        target_role = st.text_input('Target role (optional)', value=st.session_state.get('last_target_role', ''), placeholder='Leave blank to let AI infer the best role from the job description')
-        job_description = st.text_area('Job description', value=st.session_state.get('last_job_description', ''), height=330, placeholder='Paste the full job description here...')
+        if selected_job_id:
+            target_role = str(st.session_state.get('last_target_role', '') or '').strip()
+            job_description = str(st.session_state.get('last_job_description', '') or '')
+            st.markdown(f"**Target role:** {target_role or '_(not set on this approved job)_'}")
+            with st.expander('Job description (read-only)', expanded=False):
+                st.markdown(job_description.strip() or '_(empty)_')
+        else:
+            target_role = st.text_input('Target role (optional)', value=st.session_state.get('last_target_role', ''), placeholder='Leave blank to let AI infer the best role from the job description')
+            job_description = st.text_area('Job description', value=st.session_state.get('last_job_description', ''), height=330, placeholder='Paste the full job description here...')
         custom_prompt = st.text_area('Custom resume prompt (optional)', value=st.session_state.get('last_custom_prompt', ''), height=110, placeholder='Example: Keep the resume sharply aligned to backend ownership, emphasize exact named tech stacks in each company bullet, and avoid generic wording.')
 
         is_generating_resume = bool(st.session_state.get('dashboard_is_generating_resume', False))
@@ -1787,32 +1871,92 @@ def dashboard_page(user: dict) -> None:
         if is_generating_resume:
             inputs = st.session_state.get('dashboard_pending_generation') or {}
             gen_profile = storage.get_profile_by_id(inputs.get('profile_id', '')) or profile
+            cached_entry = _load_cached_improved_resume(gen_profile, inputs.get('selected_job_id', ''), inputs.get('job_description', ''))
             try:
-                with st.spinner('Generating resume content and export files...'):
-                    result = generate_resume_content(
-                        profile=gen_profile,
-                        job_description=inputs.get('job_description', ''),
-                        target_role=inputs.get('target_role', ''),
-                        custom_prompt=inputs.get('custom_prompt', ''),
-                        default_prompt=default_prompt,
-                        use_ai=bool(inputs.get('use_ai', True)),
-                        clean_generation=clean_generation,
-                    )
-                    _record_openai_usage(result, 'generate_resume')
-                    resume = result['resume']
-                    resume['bold_keywords'] = []
-                    resume['auto_bold_fit_keywords'] = False
-                    exports = _build_uploaded_docx_pdf_exports(resume=resume, profile=gen_profile, app_settings=app_settings)
-                    ats_after_generate = analyze_ats_score(resume, inputs.get('job_description', ''), target_role=inputs.get('target_role', ''))
+                if cached_entry:
+                    with st.spinner('Loading previously auto-improved resume...'):
+                        resume = copy.deepcopy(cached_entry.get('resume', {}) or {})
+                        resume['bold_keywords'] = []
+                        resume['auto_bold_fit_keywords'] = False
+                        exports = _build_uploaded_docx_pdf_exports(resume=resume, profile=gen_profile, app_settings=app_settings)
+                        ats_after_generate = analyze_ats_score(resume, inputs.get('job_description', ''), target_role=inputs.get('target_role', ''))
+                    result = {'mode': 'cached-improved', 'resume': resume}
+                else:
+                    job_id_for_request = str(inputs.get('selected_job_id', '') or '').strip()
+                    jd_text_for_request = inputs.get('job_description', '')
+                    target_role_for_request = inputs.get('target_role', '')
+                    jd_hash_for_request = _hash_job_description_for_cache(jd_text_for_request)
+                    jd_was_improved_before = bool(job_id_for_request) and storage.has_improved_resume_for_job(job_id_for_request, jd_hash_for_request)
+                    spinner_label = 'Generating resume and auto-improving for ATS...' if jd_was_improved_before else 'Generating resume content and export files...'
+                    with st.spinner(spinner_label):
+                        result = generate_resume_content(
+                            profile=gen_profile,
+                            job_description=jd_text_for_request,
+                            target_role=target_role_for_request,
+                            custom_prompt=inputs.get('custom_prompt', ''),
+                            default_prompt=default_prompt,
+                            use_ai=bool(inputs.get('use_ai', True)),
+                            clean_generation=clean_generation,
+                        )
+                        _record_openai_usage(result, 'generate_resume')
+                        resume = result['resume']
+                        resume['bold_keywords'] = []
+                        resume['auto_bold_fit_keywords'] = False
+                        ats_after_generate = analyze_ats_score(resume, jd_text_for_request, target_role=target_role_for_request)
+                        original_score_for_silent_improve = int((ats_after_generate or {}).get('overall_score', 0))
+                        silent_improve_applied = False
+                        silent_improve_succeeded = False
+                        if jd_was_improved_before and original_score_for_silent_improve < 90 and bool(inputs.get('use_ai', True)):
+                            silent_improve_applied = True
+                            silent_improve_result = improve_resume_to_target_ats(
+                                profile=gen_profile,
+                                job_description=jd_text_for_request,
+                                current_resume=resume,
+                                target_score=91,
+                                max_rounds=1,
+                                additional_requirements='',
+                                target_role=target_role_for_request,
+                                custom_prompt=inputs.get('custom_prompt', ''),
+                                default_prompt=default_prompt,
+                                use_ai=True,
+                                clean_generation=clean_generation,
+                            )
+                            _record_openai_usage_for_improve(silent_improve_result)
+                            improved_candidate = silent_improve_result.get('resume') or resume
+                            improved_candidate_ats = silent_improve_result.get('final_analysis') or _cached_ats_analysis(improved_candidate, jd_text_for_request, target_role_for_request)
+                            improved_candidate_score = int((improved_candidate_ats or {}).get('overall_score', 0))
+                            if improved_candidate_score >= 90:
+                                silent_improve_succeeded = True
+                                resume = improved_candidate
+                                resume['bold_keywords'] = []
+                                resume['auto_bold_fit_keywords'] = False
+                                ats_after_generate = improved_candidate_ats
+                                result['mode'] = 'auto-improved-on-create'
+                                st.session_state['last_ats_improve_history'] = silent_improve_result.get('history', [])
+                        exports = _build_uploaded_docx_pdf_exports(resume=resume, profile=gen_profile, app_settings=app_settings)
                 ats_score_now = int((ats_after_generate or {}).get('overall_score', 0))
                 generated_job_id = str(inputs.get('selected_job_id', '') or '').strip()
-                if generated_job_id and bool(inputs.get('use_ai', True)):
+                if not cached_entry and generated_job_id and bool(inputs.get('use_ai', True)):
                     _report_openai_fallback_to_admin(user, generated_job_id, result)
-                if generated_job_id and _enforce_low_ats_rate_limit(user, generated_job_id, ats_score_now):
+                if not cached_entry and generated_job_id and _enforce_low_ats_rate_limit(user, generated_job_id, ats_score_now):
                     st.session_state['dashboard_is_generating_resume'] = False
                     st.session_state.pop('dashboard_pending_generation', None)
                     st.rerun()
                     return
+                if not cached_entry and generated_job_id and silent_improve_succeeded:
+                    storage.save_improved_resume_cache({
+                        'profile_id': str(gen_profile.get('id', '')).strip(),
+                        'job_id': generated_job_id,
+                        'profile_hash': _hash_profile_for_cache(gen_profile),
+                        'job_description_hash': jd_hash_for_request,
+                        'resume': resume,
+                        'ats_score': ats_score_now,
+                        'original_score': original_score_for_silent_improve,
+                        'target_role': target_role_for_request,
+                        'improved_by_user_id': (user or {}).get('id', ''),
+                        'improved_by_username': (user or {}).get('username', ''),
+                        'improved_at': datetime.utcnow().isoformat() + 'Z',
+                    })
                 st.session_state['last_resume'] = resume
                 st.session_state['last_resume_job_id'] = str(inputs.get('selected_job_id', '') or '').strip()
                 st.session_state['last_exports'] = exports
@@ -1826,10 +1970,33 @@ def dashboard_page(user: dict) -> None:
                 st.session_state['last_auto_bold_fit_keywords'] = False
                 st.session_state['last_update_prompt'] = ''
                 st.session_state['last_generator_mode'] = result['mode']
+                st.session_state['dashboard_show_preview'] = False
                 if inputs.get('selected_job_id'):
                     st.session_state['last_job_id'] = inputs.get('selected_job_id', '')
                     st.session_state['last_job_company'] = inputs.get('selected_job_company', '')
-                _queue_editor_reload(resume, f"Resume generated in {result['mode']} mode.")
+                if cached_entry:
+                    improved_by = str(cached_entry.get('improved_by_username', '') or 'another user')
+                    improved_at_raw = str(cached_entry.get('improved_at', '') or '')
+                    improved_at_display = improved_at_raw.split('T')[0] if improved_at_raw else 'earlier'
+                    cached_score = int(cached_entry.get('ats_score', 0) or 0)
+                    cached_original = int(cached_entry.get('original_score', 0) or 0)
+                    _queue_editor_reload(
+                        resume,
+                        (
+                            f'Loaded a previously auto-improved resume by {improved_by} on {improved_at_display} '
+                            f'(original ATS {cached_original} → improved {cached_score}). No new AI call was made.'
+                        ),
+                    )
+                elif result.get('mode') == 'auto-improved-on-create':
+                    _queue_editor_reload(
+                        resume,
+                        (
+                            f'This job was previously auto-improved by another profile. Generated and silently auto-improved in one step '
+                            f'(ATS {original_score_for_silent_improve} → {ats_score_now}).'
+                        ),
+                    )
+                else:
+                    _queue_editor_reload(resume, f"Resume generated in {result['mode']} mode.")
             finally:
                 st.session_state['dashboard_is_generating_resume'] = False
                 st.session_state.pop('dashboard_pending_generation', None)
@@ -1842,10 +2009,10 @@ def dashboard_page(user: dict) -> None:
 
         current_ats = None
         if st.session_state.get('last_resume') and st.session_state.get('last_job_description', '').strip():
-            current_ats = analyze_ats_score(
+            current_ats = _cached_ats_analysis(
                 st.session_state.get('last_resume') or {},
                 st.session_state.get('last_job_description', ''),
-                target_role=st.session_state.get('last_target_role', ''),
+                st.session_state.get('last_target_role', ''),
             )
         current_profile = storage.get_profile_by_id(st.session_state.get('last_profile_id')) or selectable_profiles[0]
         current_template = {'id': 'uploaded_docx_style', 'name': 'Uploaded DOCX style'}
@@ -1903,75 +2070,112 @@ def dashboard_page(user: dict) -> None:
                     _record_openai_usage_for_improve(improve_result)
                 improved_resume = improve_result.get('resume', current_resume_for_improve)
                 improved_exports = _build_uploaded_docx_pdf_exports(resume=improved_resume, profile=current_profile, app_settings=app_settings)
+                improved_ats = improve_result.get('final_analysis') or _cached_ats_analysis(improved_resume, job_description_for_improve, target_role_for_improve)
+                improved_score = int((improved_ats or {}).get('overall_score', 0))
+                original_score = int((current_ats or {}).get('overall_score', 0))
                 st.session_state['last_resume'] = improved_resume
                 st.session_state['last_exports'] = improved_exports
                 st.session_state['last_generator_mode'] = improve_result.get('mode', 'ats-improve')
                 st.session_state['last_ats_improve_history'] = improve_result.get('history', [])
-                improved_ats = analyze_ats_score(improved_resume, job_description_for_improve, target_role=target_role_for_improve)
-                improved_score = int((improved_ats or {}).get('overall_score', 0))
                 improved_job_id = str(st.session_state.get('last_job_id', '') or '').strip()
                 if improved_job_id and _enforce_auto_improve_one_shot(user, improved_job_id, improved_score):
                     st.rerun()
                     return
-                _queue_editor_reload(improved_resume, 'ATS-guided improvement applied to the current draft.')
+                if improved_job_id and improved_score >= 90:
+                    storage.save_improved_resume_cache({
+                        'profile_id': str(current_profile.get('id', '')).strip(),
+                        'job_id': improved_job_id,
+                        'profile_hash': _hash_profile_for_cache(current_profile),
+                        'job_description_hash': _hash_job_description_for_cache(job_description_for_improve),
+                        'resume': improved_resume,
+                        'ats_score': improved_score,
+                        'original_score': original_score,
+                        'target_role': target_role_for_improve,
+                        'improved_by_user_id': (user or {}).get('id', ''),
+                        'improved_by_username': (user or {}).get('username', ''),
+                        'improved_at': datetime.utcnow().isoformat() + 'Z',
+                    })
+                editor_notice = f'ATS-guided improvement applied. Score: {original_score} → {improved_score}.'
+                if improved_score == original_score:
+                    editor_notice += ' (No score change — the AI made minor wording tweaks but could not raise the score this round.)'
+                _queue_editor_reload(improved_resume, editor_notice)
                 st.rerun()
         if st.session_state.get('last_resume'):
             resume = st.session_state['last_resume']
             pending_resume = st.session_state.pop('editor_pending_resume', None)
-            if pending_resume is not None:
-                _load_editor_from_resume(pending_resume, force=True)
+            below_target = bool(current_ats) and int(current_ats.get('overall_score', 0)) < 90
+            if below_target:
+                notice = st.session_state.pop('editor_notice', '')
+                if notice:
+                    st.success(notice)
+                st.info('Auto-improve the resume to raise the ATS score over 90 before editing, downloading, or reviewing tabs. Edit / Exports / ATS Notes are hidden until the score qualifies.')
             else:
-                _load_editor_from_resume(resume)
-            notice = st.session_state.pop('editor_notice', '')
-            if notice:
-                st.success(notice)
-            exports = st.session_state['last_exports']
-            tab_labels = ['Preview', 'Edit & Fix', 'Exports', 'ATS Notes']
-            if is_admin(user):
-                tab_labels.append('Job Application Answers')
-            tab_labels.extend(['Structured Data', 'Source Profile'])
-            tab_objects = dict(zip(tab_labels, st.tabs(tab_labels)))
-            with tab_objects['Preview']:
-                st.caption('Read-only PDF preview. The PDF is generated from the uploaded DOCX style; only title, summary, skills, and experience content are changed.')
-                _render_readable_pdf_preview(
-                    pdf_bytes=(exports or {}).get('pdf', b''),
-                    fallback_html=(exports or {}).get('html', ''),
-                    message=(exports or {}).get('pdf_message', ''),
-                )
-            with tab_objects['Edit & Fix']:
-                _edit_and_fix_tab(current_profile, current_template, st.session_state.get('last_job_description', ''), st.session_state.get('last_target_role', ''), st.session_state.get('last_custom_prompt', ''), default_prompt, use_ai, clean_generation)
-            with tab_objects['Exports']:
-                st.markdown('**Download behavior**')
-                pdf_message = (st.session_state.get('last_exports') or {}).get('pdf_message', '')
-                if pdf_message:
-                    st.caption(f'PDF exporter: {pdf_message}')
-                if not (st.session_state.get('last_exports') or {}).get('pdf'):
-                    st.error('PDF export failed. Check App Settings > PDF backend order / WPS custom PDF command.')
-                st.info("In the deployed app, Download PDF sends the file to the user's browser and local Downloads flow.")
-                if current_ats and int(current_ats.get('overall_score', 0)) > 90:
-                    st.success('Use the Download PDF button next to the Generated Resume title to download this ATS-qualified resume.')
+                if pending_resume is not None:
+                    _load_editor_from_resume(pending_resume, force=True)
                 else:
-                    st.warning('PDF download becomes available only when the current ATS score is over 90.')
-                latest_saved = st.session_state.get('latest_saved_resume_id', '')
-                if latest_saved:
-                    st.caption(f'Latest saved resume id: {latest_saved}')
-            with tab_objects['ATS Notes']:
-                _dashboard_ats_notes_tab(current_profile, current_template, resume, st.session_state.get('last_job_description', ''), st.session_state.get('last_target_role', ''), st.session_state.get('last_custom_prompt', ''), default_prompt, use_ai, clean_generation)
-            if 'Job Application Answers' in tab_objects:
-                with tab_objects['Job Application Answers']:
-                    _render_application_answers_tab(
-                        resume_snapshot=resume,
-                        job_description=st.session_state.get('last_job_description', ''),
-                        target_role=st.session_state.get('last_target_role', ''),
-                        use_ai=use_ai,
-                        cache_prefix='dashboard_current_resume_answers',
-                    )
-            with tab_objects['Structured Data']:
-                st.json(resume)
-            with tab_objects['Source Profile']:
-                st.json(current_profile)
+                    _load_editor_from_resume(resume)
+                notice = st.session_state.pop('editor_notice', '')
+                if notice:
+                    st.success(notice)
+                exports = st.session_state['last_exports']
+                if is_admin(user):
+                    preview_controls_col, preview_state_col = st.columns([1.2, 3.0], gap='small')
+                    with preview_controls_col:
+                        preview_is_open = bool(st.session_state.get('dashboard_show_preview', False))
+                        preview_button_label = 'Hide Preview' if preview_is_open else 'Show Preview'
+                        if st.button(preview_button_label, use_container_width=True, key='dashboard_toggle_preview_button'):
+                            st.session_state['dashboard_show_preview'] = not preview_is_open
+                            st.rerun()
+                    with preview_state_col:
+                        st.caption('Preview is hidden by default for admins. Use Show Preview only when you need to inspect the generated layout.')
+                    if st.session_state.get('dashboard_show_preview', False):
+                        _render_readable_pdf_preview(
+                            pdf_bytes=exports.get('pdf', b''),
+                            fallback_html=exports.get('html', ''),
+                            message=exports.get('pdf_message', ''),
+                        )
+                        st.divider()
+
+                    tab_labels = ['Edit & Fix', 'Exports', 'ATS Notes', 'Job Application Answers', 'Structured Data', 'Source Profile']
+                    tab_objects = dict(zip(tab_labels, st.tabs(tab_labels)))
+                    with tab_objects['Edit & Fix']:
+                        _edit_and_fix_tab(current_profile, current_template, st.session_state.get('last_job_description', ''), st.session_state.get('last_target_role', ''), st.session_state.get('last_custom_prompt', ''), default_prompt, use_ai, clean_generation)
+                    with tab_objects['Exports']:
+                        st.markdown('**Download behavior**')
+                        pdf_message = (st.session_state.get('last_exports') or {}).get('pdf_message', '')
+                        if pdf_message:
+                            st.caption(f'PDF exporter: {pdf_message}')
+                        if not (st.session_state.get('last_exports') or {}).get('pdf'):
+                            st.error('PDF export failed. Check App Settings > PDF backend order / WPS custom PDF command.')
+                        st.info("In the deployed app, Download PDF sends the file to the user's browser and local Downloads flow.")
+                        if current_ats and int(current_ats.get('overall_score', 0)) > 90:
+                            st.success('Use the Download PDF button next to the Generated Resume title to download this ATS-qualified resume.')
+                        else:
+                            st.warning('PDF download becomes available only when the current ATS score is over 90.')
+                        latest_saved = st.session_state.get('latest_saved_resume_id', '')
+                        if latest_saved:
+                            st.caption(f'Latest saved resume id: {latest_saved}')
+                    with tab_objects['ATS Notes']:
+                        _dashboard_ats_notes_tab(current_profile, current_template, resume, st.session_state.get('last_job_description', ''), st.session_state.get('last_target_role', ''), st.session_state.get('last_custom_prompt', ''), default_prompt, use_ai, clean_generation)
+                    with tab_objects['Job Application Answers']:
+                        _render_application_answers_tab(
+                            resume_snapshot=resume,
+                            job_description=st.session_state.get('last_job_description', ''),
+                            target_role=st.session_state.get('last_target_role', ''),
+                            use_ai=use_ai,
+                            cache_prefix='dashboard_current_resume_answers',
+                        )
+                    with tab_objects['Structured Data']:
+                        st.json(resume)
+                    with tab_objects['Source Profile']:
+                        st.json(current_profile)
+                else:
+                    st.info('Resume ready. Use Download PDF when the ATS score is over 90. If the score is lower, use Auto-improve resume to ATS target.')
         else:
-            st.info('Generate a resume from the left panel to see the preview, edit tools, ATS guidance, and export options here.')
+            if is_admin(user):
+                st.info('Generate a resume from the left panel to see the preview controls, edit tools, ATS guidance, and export options here.')
+            else:
+                st.info('Generate a resume from the left panel to unlock Download PDF and Auto-improve resume to ATS target.')
 
     if st.session_state.get('pending_saved_resume'):
         _post_download_dialog()
